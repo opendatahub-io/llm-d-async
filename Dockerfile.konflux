@@ -2,12 +2,10 @@
 FROM registry.access.redhat.com/ubi9/go-toolset:1.25.8@sha256:8c5aeac74b4b60dc2e5e44f6b639186b7ec2fec8f0eb9a36d4a32dcf8e255f52 AS builder
 ARG TARGETOS=linux
 ARG TARGETARCH
-ARG LDFLAGS="-s -w"
+ARG LDFLAGS
 ARG CGO_ENABLED=1
 
-USER root
-
-WORKDIR /workspace
+WORKDIR /opt/app-root/src
 # Copy the Go Modules manifests
 COPY go.mod go.mod
 COPY go.sum go.sum
@@ -32,7 +30,7 @@ RUN CGO_ENABLED=${CGO_ENABLED} GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} GOEX
 
 FROM registry.access.redhat.com/ubi9/ubi-minimal:9.7@sha256:d91be7cea9f03a757d69ad7fcdfcd7849dba820110e7980d5e2a1f46ed06ea3b
 WORKDIR /
-COPY --from=builder /workspace/async-processor .
-USER 65532:65532
+COPY --from=builder /opt/app-root/src/async-processor .
+USER 1001:1001
 
 ENTRYPOINT ["/async-processor"]
