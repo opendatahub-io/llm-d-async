@@ -12,13 +12,13 @@ on:
       prerelease:
         required: true
         type: string
-    secrets:
-      GHCR_TOKEN:
-        required: true
 
 jobs:
   docker-build-and-push:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout source
         uses: actions/checkout@v7
@@ -30,7 +30,7 @@ jobs:
           tag: ${{ inputs.tag }}
           image-name: ${{ inputs.image-name }}
           registry: ghcr.io/llm-d
-          github-token: ${{ secrets.GHCR_TOKEN }}
+          github-token: ${{ github.token }}
           prerelease: ${{ inputs.prerelease }}
 
       - name: Run Trivy scan on Async Processor image
