@@ -64,6 +64,62 @@ func TestRedisQuotaGate_Concurrency(t *testing.T) {
 	}
 }
 
+// TestRedisQuotaGate_Concurrency_TTLRefresh is a regression test for the #311
+// sibling over-admission bug: in concurrency mode the counter's TTL was set only
+// on the first acquire (new_val==1) and never refreshed, so under sustained load
+// the key expired mid-flight, the counter reset to 0, and further requests were
+// admitted beyond the limit. Every acquire must refresh the TTL so the counter
+// survives as long as there is activity (and only expires after `window` of
+// total inactivity, as crash-orphan cleanup).
+func TestRedisQuotaGate_Concurrency_TTLRefresh(t *testing.T) {
+	s := miniredis.RunT(t)
+	defer s.Close()
+	rdb := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer func() { _ = rdb.Close() }()
+
+	gate := NewRedisQuotaGate(rdb, "userid", QuotaModeConcurrency, 2, 10*time.Second, "quota:")
+	ctx := context.Background()
+	attrs := map[string]string{"userid": "user1"}
+
+	// Acquire slot 1 (counter=1, TTL=10s); hold it.
+	var rel1 []pipeline.GateReleaseFunc
+	msg1 := api.NewInternalRequest(api.InternalRouting{}, &api.RequestMessage{ID: "req1", Metadata: attrs})
+	if v, err := gate.Apply(ctx, msg1, &rel1); err != nil || v.Action != pipeline.ActionContinue {
+		t.Fatalf("acquire 1: expected continue, got %v err %v", v, err)
+	}
+
+	// Advance below the TTL, then acquire slot 2 — this must refresh the TTL.
+	s.FastForward(9 * time.Second)
+	var rel2 []pipeline.GateReleaseFunc
+	msg2 := api.NewInternalRequest(api.InternalRouting{}, &api.RequestMessage{ID: "req2", Metadata: attrs})
+	if v, err := gate.Apply(ctx, msg2, &rel2); err != nil || v.Action != pipeline.ActionContinue {
+		t.Fatalf("acquire 2: expected continue, got %v err %v", v, err)
+	}
+
+	// Advance past the ORIGINAL first-acquire TTL (18s total > 10s) but within the
+	// refreshed TTL. Both slots are still held, so the counter must remain at the
+	// limit and a 3rd acquire must be refused. Before the fix the key would have
+	// expired at ~10s, resetting the counter and wrongly admitting this request.
+	s.FastForward(9 * time.Second)
+	var rel3 []pipeline.GateReleaseFunc
+	msg3 := api.NewInternalRequest(api.InternalRouting{}, &api.RequestMessage{ID: "req3", Metadata: attrs})
+	v, err := gate.Apply(ctx, msg3, &rel3)
+	if err != nil {
+		t.Fatalf("acquire 3: unexpected error %v", err)
+	}
+	if v.Action != pipeline.ActionRefuse || msg3.GetClassification() != api.ClassificationOverflow {
+		t.Fatalf("acquire 3: counter reset mid-flight → over-admission (TTL not refreshed): got %v classification %v",
+			v, msg3.GetClassification())
+	}
+
+	for _, f := range rel1 {
+		f()
+	}
+	for _, f := range rel2 {
+		f()
+	}
+}
+
 func TestRedisQuotaGate_RateLimit(t *testing.T) {
 	s := miniredis.RunT(t)
 	defer s.Close()

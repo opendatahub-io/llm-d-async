@@ -125,7 +125,7 @@ func TestMetricDispatchGate_RecordsGateMetricValue(t *testing.T) {
 	metrics.GateMetricThreshold.DeleteLabelValues(pool)
 
 	// Saturation gate: source returns D = 1 - saturation; the gate's threshold is
-	// 1 - satThreshold. With saturation 0.3 -> D=0.7, satThreshold 0.8 -> thr=0.2.
+	// 1 - satThreshold. With saturation 0.3 -> D=0.7, satThreshold 0.8 -> threshold=0.2.
 	source := &mockMetricSource{samples: []Sample{{Value: 0.7}}}
 	gate := NewSaturationDispatchGate(source, 0.8, 0.0).WithPoolLabel(pool)
 
