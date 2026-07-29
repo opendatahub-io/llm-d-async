@@ -91,6 +91,12 @@ Pod labels serve two purposes:
 - `inference_pool: optimized-baseline` — carried into vLLM metrics via PodMonitor relabeling
   (required for the dispatch budget gate's PromQL queries)
 
+> **Using the upstream llm-d overlays instead?** They label decode pods with `llm-d.ai/*` only
+> and do not set `inference_pool`, so the relabeling produces nothing and the gate's PromQL
+> matches an empty vector, reads `NaN`, and never opens. Either add the label to your overlay as
+> the kustomization above does, or set `ap.modelServerMonitor.inferencePool` to the same value as
+> `gate_params.pool` and the chart will apply it at scrape time.
+
 Wait for the model to load:
 
 ```bash
@@ -160,7 +166,10 @@ The values file (`docs/guides/e2e-deploy/llm-d-async-values.yaml`) configures:
 >   baseline: "0.05"
 > ```
 - `modelServerMonitor.enabled: true` — creates a PodMonitor that relabels the `inference_pool`
-  pod label into vLLM metrics (required for the dispatch budget gate fallback)
+  pod label into vLLM metrics (required for the dispatch budget gate fallback). This guide puts
+  the model server and llm-d-async in the same namespace; if yours are split, also set
+  `modelServerMonitor.namespaceSelector.matchNames` to the model server's namespace, or the
+  monitor matches no pods and scrapes nothing without reporting an error
 - `podMonitor.enabled: true` — creates a PodMonitor that scrapes the llm-d-async's own
   Prometheus metrics (retry rate, success rate, latency, etc.)
 - `prometheusRule.enabled: true` — installs alert rules for high retry rate, deadline exceeded
