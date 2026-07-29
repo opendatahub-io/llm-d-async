@@ -3,6 +3,10 @@ k8s = "k8s"
 KServe = "KServe"
 vLLM = "vLLM"
 IST = "IST"
+# Go convention: `typ` is a common identifier (since `type` is a keyword);
+# `unmarshaling` is the standard Go/American spelling (typos suggests British).
+typ = "typ"
+unmarshaling = "unmarshaling"
 
 [files]
 extend-exclude = [
