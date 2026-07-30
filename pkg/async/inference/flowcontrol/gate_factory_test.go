@@ -18,11 +18,14 @@ package flowcontrol
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	"github.com/llm-d/llm-d-async/pipeline"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestGateFactory_WithCacheTTL(t *testing.T) {
@@ -251,6 +254,70 @@ func TestGateFactory_BudgetGateWithAllParams(t *testing.T) {
 	assert.NotNil(t, gate)
 }
 
+func TestGateFactory_BudgetGateCascadeSources(t *testing.T) {
+	factory := NewGateFactory("http://localhost:9090")
+	gate, err := factory.CreateGate(pipeline.GateConfig{GateType: "prometheus-budget", GateParams: map[string]any{
+		"pool":            "my-pool",
+		"max_concurrency": 100.0,
+	}})
+	require.NoError(t, err)
+
+	metricGate, ok := gate.(*MetricDispatchGate)
+	require.True(t, ok)
+	cascade, ok := metricGate.source.(*CascadeMetricSource)
+	require.True(t, ok)
+	require.Len(t, cascade.sources, 3)
+
+	exprs := make([]string, len(cascade.sources))
+	for i, s := range cascade.sources {
+		cached, ok := s.(*CachedMetricSource)
+		require.True(t, ok)
+		promSource, ok := cached.source.(*PromQLMetricSource)
+		require.True(t, ok)
+		exprs[i] = promSource.expr
+	}
+
+	// Flow control stays first for installs that enable the plugin; the metric a
+	// stock EPP always exports is next, so the cascade resolves without it; vLLM
+	// last because it needs scrape-time relabeling to carry inference_pool.
+	assert.Contains(t, exprs[0], "inference_extension_flow_control_queue_size")
+	assert.Contains(t, exprs[1], "inference_pool_per_pod_queue_size")
+	assert.Contains(t, exprs[2], "vllm:num_requests_running")
+}
+
+func TestGateFactory_BudgetGateLogsResolvedQueries(t *testing.T) {
+	var logged []string
+	logger := funcr.New(func(_, args string) { logged = append(logged, args) }, funcr.Options{})
+
+	factory := NewGateFactory("http://localhost:9090").WithLogger(logger)
+	_, err := factory.CreateGate(pipeline.GateConfig{GateType: "prometheus-budget", GateParams: map[string]any{
+		"pool": "my-pool",
+	}})
+	require.NoError(t, err)
+
+	joined := strings.Join(logged, "\n")
+	assert.Contains(t, joined, "inference_extension_flow_control_queue_size")
+	assert.Contains(t, joined, "inference_pool_per_pod_queue_size")
+	assert.Contains(t, joined, "vllm:num_requests_running")
+
+	// The resolved closing point goes to the same logger as the source queries.
+	assert.Contains(t, joined, "prometheus-budget gate configured")
+	assert.Contains(t, joined, "closesAtLoadPerReadyPod")
+}
+
+func TestGateFactory_SaturationGateLogsResolvedQuery(t *testing.T) {
+	var logged []string
+	logger := funcr.New(func(_, args string) { logged = append(logged, args) }, funcr.Options{})
+
+	factory := NewGateFactory("http://localhost:9090").WithLogger(logger)
+	_, err := factory.CreateGate(pipeline.GateConfig{GateType: "prometheus-saturation", GateParams: map[string]any{
+		"pool": "my-pool",
+	}})
+	require.NoError(t, err)
+
+	assert.Contains(t, strings.Join(logged, "\n"), "inference_extension_flow_control_pool_saturation")
+}
+
 func TestGateFactory_PrometheusQueryGateWithoutURL(t *testing.T) {
 	factory := NewGateFactory("")
 	gate, err := factory.CreateGate(pipeline.GateConfig{GateType: "prometheus-query", GateParams: map[string]any{
@@ -297,4 +364,83 @@ func TestGateFactory_PrometheusQueryGateWithAllParams(t *testing.T) {
 	}})
 	assert.NoError(t, err, "should create gate with all params specified")
 	assert.NotNil(t, gate)
+}
+
+// TestGateFactory_StampsOwnerOnMetricGate checks that the owning queue and worker
+// pool reach the gauges a metric gate records, and that the 'pool' param lands on
+// inference_pool instead of overwriting pool_name (issue #369).
+func TestGateFactory_StampsOwnerOnMetricGate(t *testing.T) {
+	owner := pipeline.GateOwner{QueueID: "team-a-premium", QueueName: "queue:a", WorkerPoolID: "model-a-pool"}
+	factory := NewGateFactory("http://localhost:9090")
+
+	gate, err := factory.CreateGate(pipeline.GateConfig{
+		GateType:   "prometheus-query",
+		GateParams: map[string]any{"query": "up", "pool": "optimized-baseline"},
+		Owner:      owner,
+	})
+	assert.NoError(t, err)
+
+	metricGate, ok := gate.(*MetricDispatchGate)
+	assert.True(t, ok, "prometheus-query should produce a MetricDispatchGate")
+	assert.Equal(t, owner, metricGate.owner)
+	assert.Equal(t, "optimized-baseline", metricGate.inferencePool)
+}
+
+// TestGateFactory_PropagatesOwnerThroughWrappers checks that the owner survives the
+// factory's recursive gate types — a gate nested inside wait-on-refuse inside
+// composite still labels its metrics with the queue that owns it (issue #369).
+func TestGateFactory_PropagatesOwnerThroughWrappers(t *testing.T) {
+	owner := pipeline.GateOwner{QueueID: "team-b-standard", QueueName: "queue:b", WorkerPoolID: "model-b-pool"}
+	factory := NewGateFactory("http://localhost:9090")
+
+	gate, err := factory.CreateGate(pipeline.GateConfig{
+		GateType: "composite",
+		GateParams: map[string]any{
+			"gates": []any{
+				map[string]any{
+					"gate_type": "wait-on-refuse",
+					"gate_params": map[string]any{
+						"gate": map[string]any{
+							"gate_type":   "prometheus-query",
+							"gate_params": map[string]any{"query": "up"},
+						},
+					},
+				},
+			},
+		},
+		Owner: owner,
+	})
+	assert.NoError(t, err)
+
+	composite, ok := gate.(*CompositeGate)
+	assert.True(t, ok)
+	assert.Len(t, composite.gates, 1)
+	waiter, ok := composite.gates[0].(*WaitOnRefuseGate)
+	assert.True(t, ok)
+	metricGate, ok := waiter.inner.(*MetricDispatchGate)
+	assert.True(t, ok)
+	assert.Equal(t, owner, metricGate.owner)
+}
+
+// TestGateFactory_PropagatesOwnerToSaturationGate covers the third recursion site,
+// tier-priority-admission's inner saturation gate (issue #369).
+func TestGateFactory_PropagatesOwnerToSaturationGate(t *testing.T) {
+	owner := pipeline.GateOwner{QueueID: "team-c-batch", QueueName: "queue:c", WorkerPoolID: "model-c-pool"}
+	factory := NewGateFactory("http://localhost:9090")
+
+	gate, err := factory.CreateGate(pipeline.GateConfig{
+		GateType: "tier-priority-admission",
+		GateParams: map[string]any{
+			"saturation_gate":        "prometheus-query",
+			"saturation_gate_params": map[string]any{"query": "up"},
+		},
+		Owner: owner,
+	})
+	assert.NoError(t, err)
+
+	tierGate, ok := gate.(*TierPriorityAdmissionGate)
+	assert.True(t, ok)
+	metricGate, ok := tierGate.saturationGate.(*MetricDispatchGate)
+	assert.True(t, ok)
+	assert.Equal(t, owner, metricGate.owner)
 }

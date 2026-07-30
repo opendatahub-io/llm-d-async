@@ -212,6 +212,18 @@ ap:
   # the inference_pool pod label into scraped metrics.
   # Required when using prometheus-budget or prometheus-saturation gates
   # without llm-d's flow control plugin enabled.
+  #
+  # The selector below matches model server pods in the release namespace only.
+  # If the model server runs in a different namespace than llm-d-async -- as in
+  # the llm-d guides, which deploy the model server to llm-d-optimized-baseline
+  # and llm-d-async to llm-d-async -- the monitor matches zero pods and scrapes
+  # nothing, with no error reported. Set namespaceSelector in that case.
+  #
+  # The inference_pool pod label is likewise absent from the llm-d guide overlays,
+  # which label decode pods with llm-d.ai/* only. Scraping those pods leaves the
+  # metrics unlabelled, so the gate's PromQL matches nothing, reads NaN, and never
+  # opens. Set inferencePool unless your own overlay adds the pod label, as
+  # docs/guides/e2e-deploy/modelserver/kustomization.yaml does.
   modelServerMonitor:
     enabled: false
     selector:
@@ -219,3 +231,20 @@ ap:
     port: modelserver
     path: /metrics
     interval: 15s
+    # Namespaces to search for model server pods. Empty means the release
+    # namespace only (prometheus-operator's default). Either list namespaces
+    # explicitly or search all of them:
+    #   namespaceSelector:
+    #     matchNames:
+    #       - llm-d-optimized-baseline
+    # or:
+    #   namespaceSelector:
+    #     any: true
+    namespaceSelector: {}
+    # Pool name written into the inference_pool metric label for pods that do not
+    # carry an inference_pool pod label. Must match the gate_params.pool of the
+    # subscriber whose gate consumes these metrics (redis.queuesConfig or
+    # gcpPubSub.topicsConfig). Pods that do carry the label keep their own value,
+    # so a single monitor can span pools that set it and pools that do not.
+    # Empty disables the fallback and preserves pod-label-only behavior.
+    inferencePool: ""
