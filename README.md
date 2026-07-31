@@ -153,7 +153,7 @@ For more fine-grained control, configure gates per queue in your configuration f
 - `composite`: Combines multiple gates. Returns the minimum budget across all inner dispatch gates and acquires quota across all inner attribute gates (all or nothing).
 - `wait-on-refuse`: Decorator that wraps a single inner gate and converts any `ActionRefuse` verdict into `ActionWait` (parking/polling in-memory instead of immediate broker redelivery).
 - `prometheus-saturation`: Queries Prometheus for pool saturation metric. The gate closes (returns `0.0`) when saturation ≥ threshold; when open it returns `(1 - saturation) - (1 - threshold)`, i.e. the margin below the threshold.
-- `prometheus-budget`: Computes a dispatch budget D using a cascade of two Prometheus metric sources. Both sources compute `max_SYS = ready_pods × max_concurrency` dynamically. The primary source uses the EPP flow control queue size: `D = 1 − (queue_size / max_SYS)`. If the primary is unavailable, it falls back to a secondary source using vLLM and pool metrics: `D = 1 − (running_requests / max_SYS)`. The gate closes when D ≤ B (baseline); callers compute `N = max_SYS × (D − B)`. See [docs/dispatch-budget.md](docs/dispatch-budget.md) for details.
+- `prometheus-budget`: Computes a dispatch budget D using a cascade of three Prometheus metric sources, taking the first that returns a sample. `[0]` EPP flow control queue size: `D = 1 − (queue_size / max_SYS)`. `[1]` EPP per-pod queue depth: `D = 1 − (mean per-pod queue depth / max_concurrency)`. `[2]` vLLM and pool metrics: `D = 1 − (running_requests / max_SYS)`. Sources `[0]` and `[2]` compute `max_SYS = ready_pods × max_concurrency` dynamically; `[1]` averages over pods, in which the `ready_pods` factor cancels. The gate closes when D ≤ B (baseline); callers compute `N = max_SYS × (D − B)`. See [docs/dispatch-budget.md](docs/dispatch-budget.md) for details.
 - `prometheus-query`: Evaluates an arbitrary user-supplied PromQL expression as the dispatch budget. The expression must resolve to an instant vector with a single sample whose value is in [0, 1]. Unlike `prometheus-saturation` and `prometheus-budget`, this gate does not construct queries internally — the user provides the complete PromQL expression. Values outside [0, 1] are clamped.
 - `endpoint-scrape`: Scrapes a raw Prometheus `/metrics` endpoint directly (no Prometheus server required). Extracts a named metric, computes saturation, and returns the available budget. Supports two modes: **direct saturation** (metric value is already in [0, 1], e.g., from the EPP) and **computed saturation** (raw count divided by `max_count_per_pod`, e.g., `vllm:num_requests_waiting`). Optionally scrapes a second endpoint for dynamic pod count.
 - `tier-priority-admission`: Implements a three-way admission verdict based on saturation, queue tier, and reservation classification. Saturation is determined by evaluating an inner gate: if the inner gate returns `ActionRefuse`, the pool is considered saturated. If the pool is saturated: (1) returns `ActionWait` if classification is `reserved` (parking worker threads cleanly); (2) drops immediately with a `429` status payload if tier is `interactive` and classification is `overflow`; (3) returns `ActionRefuse` to place back in the queue if tier is `async` or `batch` and classification is `overflow`. If not saturated, returns `ActionContinue`.
@@ -279,26 +279,78 @@ For more fine-grained control, configure gates per queue in your configuration f
   **Metric prerequisites:** The primary metric source requires llm-d's flow control plugin to be
   enabled: without it, the EPP flow control metrics will be missing and the gate will always use the fallback value.
 
-- `prometheus-budget`: Cascades two Prometheus metric sources to compute a dispatch budget D.
-  Both sources compute `max_SYS = ready_pods × max_concurrency` dynamically from the `inference_pool_ready_pods` metric.
-  The primary source computes D from the EPP's flow control queue size: `D = 1 − (queue_size / max_SYS)`.
-  If the primary metric is unavailable (e.g. EPP is down), the gate falls back to a secondary source
-  that estimates saturation from vLLM and pool metrics: `D = 1 − (running_requests / max_SYS)`.
+- `prometheus-budget`: Cascades three Prometheus metric sources to compute a dispatch budget D,
+  using the first that returns a sample:
+
+  | # | Metric | Budget | Available when |
+  |---|--------|--------|----------------|
+  | 0 | `inference_extension_flow_control_queue_size` | `D = 1 − (queue_size / max_SYS)` | EPP runs the flow control plugin |
+  | 1 | `inference_pool_per_pod_queue_size` | `D = 1 − (mean per-pod queue depth / max_concurrency)` | Always — part of EPP's base metric set |
+  | 2 | `vllm:num_requests_running` | `D = 1 − (running_requests / max_SYS)` | vLLM metrics carry an `inference_pool` label |
+
+  Sources 0 and 2 compute `max_SYS = ready_pods × max_concurrency` dynamically from the
+  `inference_pool_ready_pods` metric. Source 1 averages over pods, so the `ready_pods` factor
+  cancels and no join is needed. That also keeps it honest when the pool drains: EPP's metrics
+  refresh [returns early when the pool has no pods](https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/v1.2.1/pkg/epp/backend/metrics/logger.go#L89-L91),
+  so `inference_pool_ready_pods` and `inference_pool_average_queue_size` freeze at their last
+  values and a scaled-to-zero pool would read as idle capacity. `inference_pool_per_pod_queue_size`
+  comes from a scrape-time collector that simply stops reporting, so the source yields no sample
+  and the cascade moves on instead.
   The gate closes when `D ≤ baseline`; when open it returns `D − baseline`, so callers compute `N = max_SYS × (D − B)`.
   See [docs/dispatch-budget.md](docs/dispatch-budget.md) for the full derivation.
 
-  - `pool` (**required**): The InferencePool name. This must match both the `name` field in
-    `inference_pool_ready_pods{name="<pool>"}` (EPP metric) and, for the vLLM fallback,
-    the `inference_pool` label on scraped vLLM metrics (added via relabeling from pod labels).
+  The PromQL each source resolved to is logged at startup (`prometheus-budget metric source`), and
+  `async_gate_metric_source_available` reports whether the last evaluation got a reading from any
+  of them or fell back to `fallback`.
+
+  - `pool` (**required**): The InferencePool name. This must match the `name` field in
+    `inference_pool_ready_pods{name="<pool>"}` and `inference_pool_per_pod_queue_size{name="<pool>"}`
+    (EPP metrics) and, for the vLLM source, the `inference_pool` label on scraped vLLM metrics
+    (added via relabeling from pod labels).
   - `namespace` (optional): Kubernetes namespace to scope metric queries. Required when multiple namespaces share the same pool name with a shared Prometheus instance.
-  - `max_concurrency` (optional): Per-endpoint request capacity (`MaxConcurrency` in the [inference scheduler's saturation detector](https://github.com/llm-d/llm-d-inference-scheduler/blob/main/pkg/epp/framework/plugins/flowcontrol/saturationdetector/concurrency/config.go)). Default is `100` (matching the inference scheduler default).
+  - `max_concurrency` (optional): Per-endpoint request capacity (`MaxConcurrency` in the [inference scheduler's saturation detector](https://github.com/llm-d/llm-d-inference-scheduler/blob/main/pkg/epp/framework/plugins/flowcontrol/saturationdetector/concurrency/config.go)). Default is `100` (matching the inference scheduler default). See [sizing `max_concurrency`](#sizing-max_concurrency) below — this is a **per-pod** number, and setting it above what a pod actually serves makes the gate inert.
   - `baseline` (optional): Reserved baseline B. The gate closes when D ≤ B. Default is `0.05`.
   - `fallback` (optional): Fallback budget value (0.0-1.0) returned when all metric sources are unavailable. Default is `0.0` (fail closed).
 
-  **Metric prerequisites:** The primary metric source requires llm-d's flow control plugin to be
-  enabled; without it, the gate falls back to vLLM metrics. The fallback filters by `inference_pool` label,
-  which vLLM does not emit natively: configure Prometheus relabeling to propagate it from model server pod labels
-  (the helm chart handles this):
+  <a id="sizing-max_concurrency"></a>
+  **Sizing `max_concurrency`.** Every source in the cascade divides by `max_concurrency` per pod —
+  sources 0 and 2 divide pool-wide load by `max_SYS = ready_pods × max_concurrency`, source 1
+  averages per pod first — so whichever one resolves, the gate closes only once load reaches:
+
+  ```
+  max_concurrency × (1 − baseline)   concurrent requests per ready pod
+  ```
+
+  At the defaults that is 95 concurrent requests *per ready pod*. A pool that never gets near
+  that — a large model on a few replicas, for instance — leaves the gate permanently open, so every
+  batch request dispatches regardless of live traffic. The gate logs its resolved closing point at
+  startup so you can compare it against reality:
+
+  ```
+  "prometheus-budget gate configured" pool=... maxConcurrency=100 baseline=0.05 closesAtLoadPerReadyPod=95
+  ```
+
+  Two ways to pick a value:
+
+  - **Match the EPP.** `max_concurrency` mirrors `MaxConcurrency` in the inference scheduler's
+    saturation detector. Using the same number keeps the async gate and the EPP's own admission
+    control in agreement about when the pool is full. If you have not configured the saturation
+    detector, both defaults are `100`.
+  - **Measure it.** Drive your pool to the load you consider saturated and read the per-pod peak:
+
+    ```promql
+    max_over_time(
+      (sum(vllm:num_requests_running{inference_pool="<pool>"}) / on() inference_pool_ready_pods{name="<pool>"})[1h:]
+    )
+    ```
+
+    Set `max_concurrency` to that peak. Values well above it mean the gate never closes; values
+    well below it mean the gate sheds while the pool still has room.
+
+  **Metric prerequisites:** none for source 1, which is why it is in the cascade — the llm-d router's
+  EPP does not enable the flow control plugin source 0 needs, and source 2 filters by the
+  `inference_pool` label, which vLLM does not emit natively. To use source 2, configure Prometheus
+  relabeling to propagate that label from model server pod labels (the helm chart handles this):
 
   ```yaml
   relabelings:
@@ -314,6 +366,9 @@ For more fine-grained control, configure gates per queue in your configuration f
     The result is used directly as the dispatch budget (no transformation is applied).
   - `fallback` (optional): Fallback budget value (0.0-1.0) returned when the query fails or returns no data.
     Default is `0.0` (fail closed).
+  - `pool` (optional): The InferencePool the query is about. Purely descriptive — it does not
+    affect the query, it only sets the `inference_pool` label on `async_gate_metric_value` and
+    `async_gate_metric_threshold` so you can tell which pool a gauge is reporting on.
 
 - `endpoint-scrape`: Scrapes a raw Prometheus text-format `/metrics` endpoint directly.
   Computes budget as `clamp(1 - saturation - baseline, 0, 1)`.
@@ -571,7 +626,9 @@ The Async Processor exposes Prometheus metrics under the `llm_d_async` subsystem
 | `llm_d_async_async_queue_residence_time_millis` | Histogram | Time in milliseconds a message spent buffered in-process, from broker ingestion until a worker pulled it for processing. Measures the async delay introduced by the system (queue time). Always registered. |
 | `llm_d_async_async_dispatch_budget` | Gauge | Current dispatch budget [0.0–1.0] returned by the queue's gate; the fraction of system capacity available for new requests (0.0 = gate fully closed). Useful for diagnosing why throughput is throttled. |
 | `llm_d_async_async_pool_worker_limit` | Gauge | Configured worker concurrency limit for a pool (carries only the `pool_name` label). Compare against `llm_d_async_async_inflight_requests` to compute worker utilization. |
-| `llm_d_async_async_gate_decisions_total` | Counter | Count of gate decisions that prevented a message from being dispatched, by `reason`: `gate_closed` (no dispatch budget), `quota_exhausted` (per-attribute quota overflow), `dropped` (gate permanently rejected the request), `error` (gate evaluation failed). |
+| `llm_d_async_async_gate_decisions_total` | Counter | Count of gate decisions that prevented dispatch, by `reason`: `gate_closed` (no dispatch budget), `quota_exhausted` (per-attribute quota overflow), `dropped` (gate permanently rejected the request), `error` (gate evaluation failed). `quota_exhausted`, `dropped` and `error` count individual messages refused after being dequeued. `gate_closed` counts those plus every dequeue round in which the budget shrank the batch to zero — the way budget-based gates (`prometheus-budget`/`-saturation`/`-query`) shed work *before* a message is dequeued — so its rate reflects throttled dispatch opportunities, not messages. All four `reason` series are created at 0 when a queue starts, so a query returns 0 rather than an empty vector. |
+| `llm_d_async_async_gate_metric_value` | Gauge | Raw metric value a metric-based gate (`prometheus-saturation`/`-budget`/`-query`) last read — the number compared against the threshold below. For the saturation gate this is `1 - saturation`. |
+| `llm_d_async_async_gate_metric_threshold` | Gauge | Threshold the value above is compared against. The gate closes when `value <= threshold`, which is what drives `async_dispatch_budget` to 0. |
 
 **Labels:**
 
@@ -581,6 +638,14 @@ The Async Processor exposes Prometheus metrics under the `llm_d_async` subsystem
 | `queue_name` | Logical queue name from the queue configuration |
 | `pool_name` | Worker pool the queue routes to (`async_pool_worker_limit` carries only this label) |
 | `reason` | Gate-decision reason (only on `async_gate_decisions_total`): `gate_closed`, `quota_exhausted`, `dropped`, `error` |
+| `inference_pool` | InferencePool a gate queries (only on the two `async_gate_metric_*` gauges), from the gate's `pool` param. Empty when the gate does not name one. |
+
+`pool_name` always names the **async worker pool** that owns the series, never the
+InferencePool a gate happens to query — that is what `inference_pool` is for. Every
+per-queue series therefore carries the same `queue_id`/`queue_name`/`pool_name`
+triple and joins on it, including the two gate gauges. A **pool-level** gate (one
+configured on a worker pool rather than a queue) has no single queue, so its gauges
+carry an empty `queue_id` and `queue_name` and are keyed by `pool_name` alone.
 
 **Example PromQL queries:**
 
@@ -599,6 +664,18 @@ histogram_quantile(0.95, sum by (queue_name, le) (rate(llm_d_async_async_inferen
 
 # p95 queue residence time by queue (async delay, excluding model time)
 histogram_quantile(0.95, sum by (queue_name, le) (rate(llm_d_async_async_queue_residence_time_millis_bucket[5m])))
+
+# Why is a queue's gate closed? The gauges join on the queue triple, so you can
+# put the budget, the value it came from, and the threshold on one panel.
+llm_d_async_async_dispatch_budget
+llm_d_async_async_gate_metric_value
+llm_d_async_async_gate_metric_threshold
+
+# How much headroom does each queue's gate have?
+llm_d_async_async_gate_metric_value - on(queue_id, queue_name, pool_name) llm_d_async_async_gate_metric_threshold
+
+# Throttling rate against the pool it is throttling
+sum by (pool_name) (rate(llm_d_async_async_gate_decisions_total{reason="gate_closed"}[5m]))
 ```
 
 ## Implementations

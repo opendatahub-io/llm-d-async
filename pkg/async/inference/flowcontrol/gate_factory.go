@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/llm-d/llm-d-async/pipeline"
 	redisgate "github.com/llm-d/llm-d-async/pkg/redis"
 	promapi "github.com/prometheus/client_golang/api"
@@ -38,6 +39,7 @@ type GateFactory struct {
 	prometheusURL string
 	cacheTTL      time.Duration
 	redisClients  map[string]*goredis.Client
+	logger        logr.Logger
 }
 
 // NewGateFactory creates a new GateFactory with an optional Prometheus URL.
@@ -55,7 +57,17 @@ func NewGateFactoryWithCacheTTL(prometheusURL string, cacheTTL time.Duration) *G
 		prometheusURL: prometheusURL,
 		cacheTTL:      cacheTTL,
 		redisClients:  make(map[string]*goredis.Client),
+		logger:        logr.Discard(),
 	}
+}
+
+// WithLogger sets the logger the factory uses to report the PromQL each Prometheus
+// gate resolved to. Gates build their queries from gate_params rather than taking
+// them verbatim, so without this the only way to find out what is actually being
+// asked of Prometheus is to read the source.
+func (f *GateFactory) WithLogger(logger logr.Logger) *GateFactory {
+	f.logger = logger
+	return f
 }
 
 // Close closes all Redis clients created by this factory.
@@ -76,17 +88,25 @@ func (f *GateFactory) Close() error {
 //   - "prometheus-saturation": Queries Prometheus for pool saturation metric.
 //     Params: pool (required), threshold (default 0.8), fallback (default 0.0)
 //   - "composite": Combines multiple gates. Params: gates (JSON array of gate configurations)
-//   - "prometheus-budget": Cascades two Prometheus metric sources to compute dispatch budget D.
-//     Both sources compute max_SYS = ready_pods × max_concurrency dynamically.
-//     Primary: D = 1 − (queue_size / max_SYS) via inference_extension_flow_control_queue_size.
-//     Secondary (fallback): D = 1 − (vllm_running / max_SYS).
-//     The primary source requires llm-d's flow control plugin to be enabled.
-//     The fallback filters vLLM metrics by inference_pool label, which vLLM does not
-//     emit natively — model server pods must carry this label and Prometheus must be
-//     configured with metric relabeling to propagate it (see docs/guides/e2e-deploy.md).
+//   - "prometheus-budget": Cascades three Prometheus metric sources to compute dispatch budget D,
+//     using the first that returns a sample.
+//     [0] D = 1 − (queue_size / max_SYS) via inference_extension_flow_control_queue_size.
+//     Requires llm-d's flow control plugin, which the llm-d router does not enable.
+//     [1] D = 1 − (mean per-pod queue depth / max_concurrency) via inference_pool_per_pod_queue_size.
+//     Part of EPP's base metric set, so this is the source a stock install lands on.
+//     [2] D = 1 − (vllm_running / max_SYS). Filters vLLM metrics by inference_pool label,
+//     which vLLM does not emit natively — model server pods must carry this label and
+//     Prometheus must be configured with metric relabeling to propagate it
+//     (see docs/guides/e2e-deploy.md).
+//     Sources [0] and [2] compute max_SYS = ready_pods × max_concurrency dynamically; [1] averages
+//     over pods, in which the ready_pods factor cancels.
 //     Gate closes when D ≤ B (baseline); returns D − B when open, so callers compute
 //     N = max_SYS × (D − B). Params: pool (required),
 //     max_concurrency (default 100), baseline (default 0.05), fallback (default 0.0)
+//     max_concurrency is per ready pod, not for the pool as a whole: the gate closes
+//     once the observed load reaches max_concurrency × (1 − baseline) per ready pod.
+//     Set it too high for the pool's real capacity and the gate never closes; the
+//     resolved closing point is logged at gate creation so this is visible.
 //   - "prometheus-query": Evaluates an arbitrary user-supplied PromQL expression as the dispatch
 //     budget. The expression must resolve to an instant vector with a single sample whose value
 //     is in [0, 1]. Unlike prometheus-saturation and prometheus-budget, this gate does not
@@ -109,6 +129,7 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 
 		var innerGates []pipeline.Gate
 		for _, innerCfg := range configs {
+			innerCfg.Owner = cfg.Owner
 			gate, err := f.CreateGate(innerCfg)
 			if err != nil {
 				return nil, fmt.Errorf("composite gate failed to create inner gate %q: %w", innerCfg.GateType, err)
@@ -124,6 +145,7 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 			return nil, err
 		}
 
+		innerCfg.Owner = cfg.Owner
 		innerGate, err := f.CreateGate(innerCfg)
 		if err != nil {
 			return nil, fmt.Errorf("wait-on-refuse gate failed to create inner gate %q: %w", innerCfg.GateType, err)
@@ -144,6 +166,7 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 		satGate, err := f.CreateGate(pipeline.GateConfig{
 			GateType:   satGateType,
 			GateParams: satGateParams,
+			Owner:      cfg.Owner,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("tier-priority-admission gate failed to create saturation gate %q: %w", satGateType, err)
@@ -225,12 +248,15 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 		if err != nil {
 			return nil, err
 		}
+		f.logger.Info("prometheus-saturation metric source",
+			"pool", paramString(params, "pool", ""), "query", source.Expr())
 		var ms MetricSource = source
 		if f.cacheTTL > 0 {
 			ms = NewCachedMetricSource(source, f.cacheTTL)
 		}
 		return NewSaturationDispatchGate(ms, threshold, fallback).
-			WithPoolLabel(paramString(params, "pool", "")), nil
+			WithOwner(cfg.Owner).
+			WithInferencePool(paramString(params, "pool", "")), nil
 
 	case "prometheus-budget":
 		if f.prometheusURL == "" {
@@ -263,20 +289,43 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 		promConfig := promapi.Config{Address: f.prometheusURL}
 		namespace := paramString(params, "namespace", "")
 
-		primary, err := NewFlowControlQueueSizePromQL(promConfig, pool, maxConcurrency, namespace)
+		flowControlSource, err := NewFlowControlQueueSizePromQL(promConfig, pool, maxConcurrency, namespace)
 		if err != nil {
 			return nil, err
 		}
-		secondary, err := NewVLLMSaturationPromQL(promConfig, pool, maxConcurrency, namespace)
+		poolQueueSource, err := NewPoolQueueSizePromQL(promConfig, pool, maxConcurrency, namespace)
+		if err != nil {
+			return nil, err
+		}
+		vllmSource, err := NewVLLMSaturationPromQL(promConfig, pool, maxConcurrency, namespace)
 		if err != nil {
 			return nil, err
 		}
 
-		var ms MetricSource = NewCascadeMetricSource(
-			cachedSource(primary, f.cacheTTL),
-			cachedSource(secondary, f.cacheTTL),
+		sources := []*PromQLMetricSource{flowControlSource, poolQueueSource, vllmSource}
+		cascaded := make([]MetricSource, 0, len(sources))
+		for i, s := range sources {
+			f.logger.Info("prometheus-budget metric source",
+				"pool", pool, "sourceIndex", i, "query", s.Expr())
+			cascaded = append(cascaded, cachedSource(s, f.cacheTTL))
+		}
+
+		var ms MetricSource = NewCascadeMetricSource(cascaded...)
+
+		// Report the resolved closing point. Every source in the cascade divides
+		// by max_concurrency per pod, so a value the pool can never reach leaves
+		// the gate permanently open with nothing in the logs or metrics to say so.
+		// Surfacing it here makes a mis-sized max_concurrency visible at startup.
+		f.logger.Info("prometheus-budget gate configured",
+			"pool", pool,
+			"maxConcurrency", maxConcurrency,
+			"baseline", baseline,
+			"closesAtLoadPerReadyPod", maxConcurrency*(1-baseline),
 		)
-		return NewBudgetDispatchGate(ms, baseline, fallback).WithPoolLabel(pool), nil
+
+		return NewBudgetDispatchGate(ms, baseline, fallback).
+			WithOwner(cfg.Owner).
+			WithInferencePool(pool), nil
 
 	case "prometheus-query":
 		if f.prometheusURL == "" {
@@ -298,10 +347,12 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 		if err != nil {
 			return nil, err
 		}
-		// Optional 'pool' param labels the async_gate_metric_value gauge; set it to
-		// match the inference pool referenced in the query.
+		// Optional 'pool' param records which InferencePool the query is about, as
+		// the inference_pool label on async_gate_metric_value; it does not affect
+		// the query. pool_name comes from the queue or pool that owns the gate.
 		return NewMetricDispatchGate(cachedSource(source, f.cacheTTL), 0.0, fallback).
-			WithPoolLabel(paramString(params, "pool", "")), nil
+			WithOwner(cfg.Owner).
+			WithInferencePool(paramString(params, "pool", "")), nil
 
 	case "endpoint-scrape":
 		url := paramString(params, "url", "")
