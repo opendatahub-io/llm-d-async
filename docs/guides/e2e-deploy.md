@@ -14,9 +14,13 @@ export LLM_D_REPO=/path/to/llm-d        # local checkout of github.com/llm-d/llm
 export ASYNC_REPO=/path/to/llm-d-async   # this repo
 export NAMESPACE=llm-d-async              # choose your namespace
 export GAIE_VERSION=v1.5.0
+export ROUTER_CHART_VERSION=v0.9.0
 export GATEWAY_API_VERSION=v1.5.1
 export GUIDE_NAME=optimized-baseline
 ```
+
+`GAIE_VERSION` and `ROUTER_CHART_VERSION` track upstream; `${LLM_D_REPO}/guides/env.sh`
+is the source of truth for the versions the llm-d guides are tested against.
 
 ## Step 1: Install CRDs
 
@@ -43,7 +47,7 @@ export PATH="$PWD/istio-${ISTIO_VERSION}/bin:$PATH"
 istioctl install -y --set values.pilot.env.ENABLE_GATEWAY_API_INFERENCE_EXTENSION=true
 ```
 
-Reference: [llm-d istio gateway guide](https://github.com/llm-d/llm-d/blob/main/guides/prereq/gateways/istio.md)
+Reference: [llm-d istio gateway guide](https://github.com/llm-d/llm-d/blob/main/docs/infrastructure/gateway/istio.md)
 
 ## Step 4: Deploy Gateway
 
@@ -57,22 +61,30 @@ kubectl wait --for=jsonpath='{.status.conditions[?(@.type=="Programmed")].status
 
 ```bash
 helm install ${GUIDE_NAME} \
-    oci://registry.k8s.io/gateway-api-inference-extension/charts/inferencepool \
-    -f ${LLM_D_REPO}/guides/recipes/scheduler/base.values.yaml \
-    -f ${LLM_D_REPO}/guides/${GUIDE_NAME}/scheduler/${GUIDE_NAME}.values.yaml \
+    oci://ghcr.io/llm-d/charts/llm-d-router-gateway \
+    -f ${LLM_D_REPO}/guides/recipes/router/base.values.yaml \
+    -f ${LLM_D_REPO}/guides/${GUIDE_NAME}/router/${GUIDE_NAME}.values.yaml \
+    -f ${LLM_D_REPO}/guides/recipes/router/features/monitoring.values.yaml \
     --set provider.name=istio \
-    --set experimentalHttpRoute.enabled=true \
-    --set experimentalHttpRoute.inferenceGatewayName=llm-d-inference-gateway \
-    --set inferenceExtension.monitoring.prometheus.enabled=true \
-    -n ${NAMESPACE} --version ${GAIE_VERSION}
+    --set httpRoute.create=true \
+    --set httpRoute.inferenceGatewayName=llm-d-inference-gateway \
+    -n ${NAMESPACE} --version ${ROUTER_CHART_VERSION}
 ```
 
-`monitoring.prometheus.enabled=true` creates:
-- A `ServiceMonitor` for EPP metrics (`optimized-baseline-epp-monitor`)
-- A metrics reader `Secret` with a bearer token (`inference-gateway-sa-metrics-reader-secret`)
-- Proper RBAC (ClusterRoleBinding to `system:auth-delegator` for the EPP ServiceAccount)
+This creates the EPP `Deployment` and `Service`, an `InferencePool` named
+`optimized-baseline` (selecting pods labeled `llm-d.ai/guide: optimized-baseline`,
+which is what Step 6 applies), an `HTTPRoute` attached to the gateway, and — from
+`monitoring.values.yaml` — a `ServiceMonitor` named `optimized-baseline-epp-monitor`
+scraping EPP `/metrics` every 10s. The chart also creates a dedicated `ClusterRole`
+and `ClusterRoleBinding` for the EPP ServiceAccount granting `tokenreviews`,
+`subjectaccessreviews`, and `nonResourceURLs: /metrics`.
 
-Reference: [llm-d monitoring docs](https://github.com/llm-d/llm-d/blob/main/docs/monitoring/README.md)
+The recipe leaves metrics authentication off (`auth.enabled: false`), so the
+ServiceMonitor scrapes without a bearer token and no metrics-reader `Secret` is
+created. If you enable auth, Prometheus needs a token with the `/metrics`
+permission granted by that ClusterRole.
+
+Reference: [llm-d observability setup](https://github.com/llm-d/llm-d/blob/main/docs/operations/observability/setup.md)
 
 ## Step 6: Deploy vLLM model server (Qwen/Qwen3-0.6B)
 
@@ -107,10 +119,13 @@ kubectl wait --for=condition=Ready pod -l llm-d.ai/role=decode -n ${NAMESPACE} -
 
 ```bash
 cd ${LLM_D_REPO}
-./docs/monitoring/scripts/install-prometheus-grafana.sh
+./guides/recipes/observability/install-prometheus-grafana.sh
 ```
 
-Reference: [Prometheus/Grafana quickstart](https://github.com/llm-d/llm-d/blob/main/docs/monitoring/prometheus-grafana-stack.md)
+This installs the kube-prometheus-stack into the `llm-d-monitoring` namespace,
+watching all namespaces.
+
+Reference: [llm-d observability setup](https://github.com/llm-d/llm-d/blob/main/docs/operations/observability/setup.md)
 
 Verify EPP metrics are flowing into Prometheus:
 
@@ -150,7 +165,9 @@ helm install llm-d-async ${ASYNC_REPO}/charts/llm-d-async/ \
 The values file (`docs/guides/e2e-deploy/llm-d-async-values.yaml`) configures:
 - Image: `ghcr.io/llm-d/llm-d-async:938cd44`
 - Queue: Redis sorted-set with `redis.url` set directly (chart creates the Secret), configured via `queuesConfig`
-- Gate: `prometheus-budget` with pool=`optimized-baseline`, max_concurrency=100, baseline=0.05 (per-queue)
+- Gate: `prometheus-budget` with pool=`optimized-baseline`, max_concurrency=100, baseline=0.05 (per-queue).
+  `max_concurrency` is a **per ready pod** capacity — see [Size `max_concurrency` for your pool](#size-max_concurrency-for-your-pool)
+  before reusing this value on your own model
 - Prometheus URL pointing to the cluster's `llmd-kube-prometheus-stack-prometheus` service
 
 > **Multi-namespace deployments:** If the cluster has multiple inference pools
@@ -177,6 +194,48 @@ The values file (`docs/guides/e2e-deploy/llm-d-async-values.yaml`) configures:
 - `grafana.dashboards.enabled: true` — provisions a Grafana dashboard (via sidecar) with
   request rate, outcome breakdown, success/retry gauges, and latency percentiles
 
+### Size `max_concurrency` for your pool
+
+`max_concurrency` is the request capacity of **one ready pod**, not of the pool. Every source in
+the cascade divides by it per pod — sources 0 and 2 divide pool-wide load by
+`max_SYS = ready_pods × max_concurrency`, source 1 averages per pod first — so whichever one
+resolves, the gate closes only once load reaches:
+
+```
+max_concurrency × (1 - baseline)   concurrent requests per ready pod
+```
+
+With the values above that is `100 × 0.95` = **95 concurrent requests per pod**, and this guide
+deploys a single Qwen3-0.6B replica. That is reachable here — the saturation test below drives
+200 concurrent requests, and 100 also matches the default `MaxConcurrency` of the EPP's saturation
+detector, so the async gate and the EPP agree on when the pool is full.
+
+It is not automatically reachable anywhere else. Point this configuration at a larger model on a
+few replicas and a realistic workload may peak in the single digits per pod, far below the closing
+point — in which case the gate never closes and every batch request dispatches regardless of live
+traffic, which is the exact failure the gate exists to prevent.
+
+The processor logs its resolved closing point when it builds the gate, so check it against reality:
+
+```bash
+kubectl logs -n ${NAMESPACE} -l app.kubernetes.io/name=llm-d-async | grep "prometheus-budget gate configured"
+# "prometheus-budget gate configured" pool=optimized-baseline maxConcurrency=100 baseline=0.05 closesAtLoadPerReadyPod=95
+```
+
+To derive the value for your own model and hardware, drive the pool to the load you consider
+saturated and read the per-pod peak:
+
+```bash
+kubectl run --rm -i prom-peak --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
+    curl -s --data-urlencode \
+    'query=max_over_time((sum(vllm:num_requests_running{inference_pool="optimized-baseline"}) / on() inference_pool_ready_pods{name="optimized-baseline"})[1h:])' \
+    'http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query'
+```
+
+Set `max_concurrency` to that peak. Well above it and the gate never closes; well below it and the
+gate sheds while the pool still has room. If you change it, update the `* 100` divisor in the
+verification queries below to match.
+
 ## Verify
 
 ### Check pods and gate status
@@ -185,9 +244,13 @@ The values file (`docs/guides/e2e-deploy/llm-d-async-values.yaml`) configures:
 # All pods running
 kubectl get pods -n ${NAMESPACE}
 
-# Async processor logs should show "using fallback metric source" (vLLM saturation),
-# NOT "all metric sources unavailable"
-kubectl logs -n ${NAMESPACE} -l app.kubernetes.io/name=llm-d-async --tail=10
+# At startup, "prometheus-budget metric source" lines print the PromQL each cascade
+# source resolved to, indexed 0-2. Then "metric source resolved" reports which one
+# answered — expect sourceIndex=1 (EPP per-pod queue depth), since the llm-d router's
+# EPP does not enable the flow control plugin source 0 needs.
+# You should NOT see "all metric sources unavailable".
+kubectl logs -n ${NAMESPACE} -l app.kubernetes.io/name=llm-d-async --tail=20
+
 ```
 
 ### Verify metrics pipeline
@@ -210,8 +273,17 @@ until kubectl run --rm -i prom-wait-$RANDOM --image=curlimages/curl --restart=Ne
 done
 echo "vLLM metrics available."
 
-# Full gate budget query (should return 1.0 at idle)
+# Full gate budget query (should return 1.0 at idle). This is cascade source 1, the
+# one a stock llm-d install lands on; source 2 (vLLM) is only reached if this returns
+# nothing, and source 0 needs EPP's flow control plugin.
 kubectl run --rm -i prom-budget --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
+    curl -s --data-urlencode \
+    'query=1 - (avg by(name)(inference_pool_per_pod_queue_size{name="optimized-baseline"}) / 100)' \
+    'http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query'
+# Expected: value = 1
+
+# The vLLM fallback (source 2), which needs the relabeled inference_pool label
+kubectl run --rm -i prom-budget-vllm --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
     curl -s --data-urlencode \
     'query=1 - (sum(vllm:num_requests_running{inference_pool="optimized-baseline"}) / on() (inference_pool_ready_pods{name="optimized-baseline"} * 100))' \
     'http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query'
@@ -275,8 +347,18 @@ kubectl run --rm -i test-queued --image=redis --restart=Never -n ${NAMESPACE} --
     redis-cli -h ${REDIS_HOST} ZCARD request-sortedset
 # Expected: 1
 
-# Async processor logs should show: "using fallback value" {"fallback": 0, "error": "invalid metric value: NaN"}
+# Async processor logs should show "using fallback value" {"fallback": 0}. The accompanying
+# error depends on which source ran out last — "all metric sources unavailable" once every
+# source has gone empty, or "invalid metric value: NaN" while the vLLM source still has
+# series inside Prometheus' staleness window but ready_pods has reached zero.
 kubectl logs -n ${NAMESPACE} -l app.kubernetes.io/name=llm-d-async --tail=5
+
+# The same thing as a metric: 0 means the budget below is the configured fallback,
+# not a reading. (1 would mean the pool really is reporting no capacity.)
+kubectl run --rm -i prom-gate-src --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
+    curl -s --data-urlencode 'query=llm_d_async_async_gate_metric_source_available' \
+    'http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query'
+# Expected: value = 0 while the pool is scaled down
 
 # Scale back up — gate opens, queued request gets dispatched
 kubectl scale deployment vllm-qwen3-0-6b-decode -n ${NAMESPACE} --replicas=1

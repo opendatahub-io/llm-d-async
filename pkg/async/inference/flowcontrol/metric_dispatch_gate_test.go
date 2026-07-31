@@ -23,6 +23,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/llm-d/llm-d-async/pipeline"
 	"github.com/llm-d/llm-d-async/pkg/metrics"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
@@ -118,21 +119,75 @@ func TestBudgetDispatchGate(t *testing.T) {
 
 // TestMetricDispatchGate_RecordsGateMetricValue verifies that a metric gate
 // records the raw value it read and the threshold it compared against, labeled by
-// pool (issue #217, "Saturation Metric Value").
+// its owning queue and worker pool plus the InferencePool it queries
+// (issues #217, "Saturation Metric Value", and #369, label collision).
 func TestMetricDispatchGate_RecordsGateMetricValue(t *testing.T) {
-	const pool = "test-pool-217"
-	metrics.GateMetricValue.DeleteLabelValues(pool)
-	metrics.GateMetricThreshold.DeleteLabelValues(pool)
+	owner := pipeline.GateOwner{QueueID: "q-217", QueueName: "queue-217", WorkerPoolID: "test-pool-217"}
+	const inferencePool = "optimized-baseline"
+	labels := []string{owner.QueueID, owner.QueueName, owner.WorkerPoolID, inferencePool}
+	metrics.GateMetricValue.DeleteLabelValues(labels...)
+	metrics.GateMetricThreshold.DeleteLabelValues(labels...)
 
 	// Saturation gate: source returns D = 1 - saturation; the gate's threshold is
 	// 1 - satThreshold. With saturation 0.3 -> D=0.7, satThreshold 0.8 -> threshold=0.2.
 	source := &mockMetricSource{samples: []Sample{{Value: 0.7}}}
-	gate := NewSaturationDispatchGate(source, 0.8, 0.0).WithPoolLabel(pool)
+	gate := NewSaturationDispatchGate(source, 0.8, 0.0).WithOwner(owner).WithInferencePool(inferencePool)
 
 	_ = gate.Budget(context.Background())
 
-	require.InDelta(t, 0.7, testutil.ToFloat64(metrics.GateMetricValue.WithLabelValues(pool)), 1e-9)
-	require.InDelta(t, 0.2, testutil.ToFloat64(metrics.GateMetricThreshold.WithLabelValues(pool)), 1e-9)
+	require.InDelta(t, 0.7, testutil.ToFloat64(metrics.GateMetricValue.WithLabelValues(labels...)), 1e-9)
+	require.InDelta(t, 0.2, testutil.ToFloat64(metrics.GateMetricThreshold.WithLabelValues(labels...)), 1e-9)
+}
+
+// availableTestPool is the InferencePool label the source-available tests use; the
+// gauge carries the same label set as async_gate_metric_value so the three join.
+const availableTestPool = "optimized-baseline"
+
+func TestMetricDispatchGate_RecordsMetricSourceAvailable(t *testing.T) {
+	// A fallback budget and a real reading of the same number are otherwise
+	// indistinguishable; this gauge is what separates them.
+	tests := []struct {
+		name      string
+		source    *mockMetricSource
+		available float64
+	}{
+		{"usable reading", &mockMetricSource{samples: []Sample{{Value: 0.7}}}, 1},
+		{"query error", &mockMetricSource{err: errors.New("conn refused")}, 0},
+		{"no samples", &mockMetricSource{samples: []Sample{}}, 0},
+		{"NaN value", &mockMetricSource{samples: []Sample{{Value: math.NaN()}}}, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			owner := pipeline.GateOwner{QueueID: "q-361", QueueName: "queue-361", WorkerPoolID: "test-pool-361-" + tt.name}
+			labels := []string{owner.QueueID, owner.QueueName, owner.WorkerPoolID, availableTestPool}
+			metrics.GateMetricSourceAvailable.DeleteLabelValues(labels...)
+
+			gate := NewBudgetDispatchGate(tt.source, 0.05, 0.0).WithOwner(owner).WithInferencePool(availableTestPool)
+			_ = gate.Budget(context.Background())
+
+			require.InDelta(t, tt.available,
+				testutil.ToFloat64(metrics.GateMetricSourceAvailable.WithLabelValues(labels...)), 1e-9)
+		})
+	}
+}
+
+func TestMetricDispatchGate_MetricSourceAvailableFlipsBack(t *testing.T) {
+	owner := pipeline.GateOwner{QueueID: "q-361-recovery", QueueName: "queue-361-recovery", WorkerPoolID: "test-pool-361-recovery"}
+	labels := []string{owner.QueueID, owner.QueueName, owner.WorkerPoolID, availableTestPool}
+	metrics.GateMetricSourceAvailable.DeleteLabelValues(labels...)
+
+	source := &switchableMetricSource{err: errors.New("conn refused")}
+	gate := NewBudgetDispatchGate(source, 0.05, 0.0).WithOwner(owner).WithInferencePool(availableTestPool)
+
+	_ = gate.Budget(context.Background())
+	require.InDelta(t, 0.0,
+		testutil.ToFloat64(metrics.GateMetricSourceAvailable.WithLabelValues(labels...)), 1e-9)
+
+	source.set([]Sample{{Value: 0.7}}, nil)
+	_ = gate.Budget(context.Background())
+	require.InDelta(t, 1.0,
+		testutil.ToFloat64(metrics.GateMetricSourceAvailable.WithLabelValues(labels...)), 1e-9)
 }
 
 // switchableMetricSource allows changing what Query returns between calls.
