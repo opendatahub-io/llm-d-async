@@ -181,8 +181,15 @@ func NewGCPPubSubMQFlow(pubsubOpts Options, fns ...PubSubOption) (*PubSubMQFlow,
 		// Determine gate for this topic
 		var gate pipeline.Gate
 		if p.gateFactory != nil && cfg.GateType != "" {
-			// Use factory to create per-topic gate
-			gate, err = p.gateFactory.CreateGate(cfg.GateConfig)
+			// Use factory to create per-topic gate. The subscriber ID is what the
+			// rest of this backend's metrics use as queue_name (there is no
+			// separate queue ID), so the gate's own gauges join with them.
+			gateCfg := cfg.GateConfig
+			gateCfg.Owner = pipeline.GateOwner{
+				QueueName:    cfg.SubscriberID,
+				WorkerPoolID: workerPoolID,
+			}
+			gate, err = p.gateFactory.CreateGate(gateCfg)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create gate for topic subscriber %q (gate_type=%q): %w", cfg.SubscriberID, cfg.GateType, err)
 			}
@@ -516,6 +523,8 @@ func (r *PubSubMQFlow) requestWorker(ctx context.Context, pubSubClient *pubsub.C
 
 	sub := pubSubClient.Subscriber(subscriberID)
 
+	metrics.InitGateDecisions("", subscriberID, poolID)
+
 	for ctx.Err() == nil {
 		receiveCtx, cancel := context.WithCancel(ctx)
 		budget := gate.Budget(ctx)
@@ -542,6 +551,13 @@ func (r *PubSubMQFlow) requestWorker(ctx context.Context, pubSubClient *pubsub.C
 		sub.ReceiveSettings.MaxOutstandingMessages = currBatchSize
 		sub.ReceiveSettings.NumGoroutines = 1
 		if currBatchSize <= 0 {
+			// Same pre-dequeue back-pressure as the sorted-set path: with no
+			// outstanding-message slots the receive callback never runs, so
+			// gate.Apply never records the refusal. Count the throttled receive
+			// window instead (#368). Unlike Redis there is no cheap depth probe
+			// — the subscription backlog comes from Cloud Monitoring — so this
+			// counts the window whether or not messages happen to be waiting.
+			metrics.RecordGateDecision(metrics.ReasonGateClosed, "", subscriberID, poolID)
 			<-receiveCtx.Done()
 			cancel()
 			continue

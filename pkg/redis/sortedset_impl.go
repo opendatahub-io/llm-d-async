@@ -171,9 +171,24 @@ func NewRedisSortedSetFlow(flowOpts SortedSetFlowOptions, connOpts ConnectionOpt
 
 	r.configMap = make(map[string]queueConfig, len(configs))
 	for _, cfg := range configs {
+		// Normalize before anything reads it: configMap is the source of the
+		// pool_name label on this queue's metrics, and an unset WorkerPoolID
+		// there would label them "" while the request channel below — and every
+		// pool-keyed series — says "default".
+		if cfg.WorkerPoolID == "" {
+			cfg.WorkerPoolID = "default"
+		}
+		workerPoolID := cfg.WorkerPoolID
+
 		var gate pipeline.Gate
 		if r.gateFactory != nil && cfg.GateType != "" {
-			gate, err = r.gateFactory.CreateGate(cfg.GateConfig)
+			gateCfg := cfg.GateConfig
+			gateCfg.Owner = pipeline.GateOwner{
+				QueueID:      cfg.ID,
+				QueueName:    cfg.QueueName,
+				WorkerPoolID: workerPoolID,
+			}
+			gate, err = r.gateFactory.CreateGate(gateCfg)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create gate for queue %q (gate_type=%q): %w", cfg.QueueName, cfg.GateType, err)
 			}
@@ -181,11 +196,6 @@ func NewRedisSortedSetFlow(flowOpts SortedSetFlowOptions, connOpts ConnectionOpt
 			gate = r.gate
 		} else {
 			gate = pipeline.ConstOpenGate()
-		}
-
-		workerPoolID := cfg.WorkerPoolID
-		if workerPoolID == "" {
-			workerPoolID = "default"
 		}
 
 		found := false
@@ -408,6 +418,8 @@ func (r *RedisSortedSetFlow) requestWorker(ctx context.Context, msgChannel chan 
 		gate = r.gate
 	}
 
+	metrics.InitGateDecisions(queueID, queueName, r.poolNameFor(queueID))
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -418,16 +430,36 @@ func (r *RedisSortedSetFlow) requestWorker(ctx context.Context, msgChannel chan 
 	}
 }
 
+// poolNameFor returns the worker pool a queue routes to, or "" when the queue has
+// no config entry (the metric label is then empty rather than wrong).
+func (r *RedisSortedSetFlow) poolNameFor(queueID string) string {
+	if cfg, ok := r.configMap[queueID]; ok {
+		return cfg.WorkerPoolID
+	}
+	return ""
+}
+
 func (r *RedisSortedSetFlow) processMessages(ctx context.Context, msgChannel chan *api.InternalRequest, queueName string, queueID string, gate pipeline.Gate, logger logr.Logger) {
 	currentTime := float64(time.Now().Unix())
 
 	budget := gate.Budget(ctx)
-	poolName := ""
-	if cfg, ok := r.configMap[queueID]; ok {
-		poolName = cfg.WorkerPoolID
-	}
+	poolName := r.poolNameFor(queueID)
 	metrics.SetDispatchBudget(budget, queueID, queueName, poolName)
 	batchSize := int(math.Floor(float64(r.batchSize) * budget))
+	if batchSize <= 0 {
+		// Back-pressure here is applied pre-dequeue: the budget shrank the batch
+		// to zero, so no message reaches gate.Apply below — the only other site
+		// that records a refusal. Count the throttled poll itself, or gate_closed
+		// stays silent exactly while the gate is doing its job (#368). Only count
+		// when work is actually waiting; an idle queue was not held back.
+		depth, err := r.rdb.ZCard(ctx, queueName).Result()
+		if err != nil {
+			logger.V(logutil.DEFAULT).Error(err, "Failed to read queue depth for a closed gate", "queue", queueName)
+		} else if depth > 0 {
+			metrics.RecordGateDecision(metrics.ReasonGateClosed, queueID, queueName, poolName)
+		}
+		return
+	}
 
 	for i := 0; i < batchSize; i++ {
 		results, err := r.rdb.ZPopMin(ctx, queueName, 1).Result()
