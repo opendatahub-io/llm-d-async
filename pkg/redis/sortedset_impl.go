@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"os"
 	"sync"
 	"time"
 
@@ -20,21 +19,8 @@ import (
 	logutil "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/util/logging"
 )
 
-// parseGateParams parses a JSON-encoded string (from --redis.ss.gate-params)
-// into a map[string]any for gate parameter configuration.
-// Used to pass gate parameters from CLI or YAML to the gate factory.
-func parseGateParams(s string) (map[string]any, error) {
-	m := map[string]any{}
-	if s == "" || s == "{}" {
-		return m, nil
-	}
-	if err := json.Unmarshal([]byte(s), &m); err != nil {
-		return nil, fmt.Errorf("failed to parse gate params JSON: %w", err)
-	}
-	return m, nil
-}
-
-type queueConfig struct {
+// SortedSetQueueConfig defines a single queue entry in the sorted-set transport config.
+type SortedSetQueueConfig struct {
 	ID                 string `json:"id,omitempty"`
 	QueueName          string `json:"queue_name,omitempty"`
 	ResultQueueName    string `json:"result_queue_name,omitempty"`
@@ -84,7 +70,7 @@ type RedisSortedSetFlow struct {
 	activeReleases          sync.Map
 	gate                    pipeline.Gate
 	gateFactory             pipeline.GateFactory
-	configMap               map[string]queueConfig
+	configMap               map[string]SortedSetQueueConfig
 	defaultRequestQueueName string
 	defaultResultQueueName  string
 	workerPools             []pipeline.WorkerPoolConfig
@@ -113,53 +99,27 @@ func (c *redisCancellationChecker) IsCancelled(ctx context.Context, requestID, r
 	return token == requestToken, nil
 }
 
-// SortedSetOption is a functional option for configuring RedisSortedSetFlow
-type SortedSetOption func(*RedisSortedSetFlow)
-
-// WithGateFactory sets a GateFactory for per-queue gate instantiation.
-// When set, gates are created per queue from config, overriding any global gate.
-func WithGateFactory(factory pipeline.GateFactory) SortedSetOption {
-	return func(r *RedisSortedSetFlow) {
-		r.gateFactory = factory
-	}
-}
-
-// WithSortedSetRedisTracing enables per-command Redis tracing spans via redisotel.
-func WithSortedSetRedisTracing(enable bool) SortedSetOption {
-	return func(r *RedisSortedSetFlow) {
-		r.enableTracing = enable
-	}
-}
-
-// WithSortedSetWorkerPools sets the pool configurations to resolve named pools.
-func WithSortedSetWorkerPools(workerPools []pipeline.WorkerPoolConfig) SortedSetOption {
-	return func(r *RedisSortedSetFlow) {
-		r.workerPools = workerPools
-	}
-}
-
-func NewRedisSortedSetFlow(flowOpts SortedSetFlowOptions, connOpts ConnectionOptions, fns ...SortedSetOption) (*RedisSortedSetFlow, error) {
-	configs, err := loadQueueConfigs(flowOpts)
-	if err != nil {
-		return nil, err
-	}
-	redisOpts, err := ParseRedisOptions(connOpts.URL)
+// NewRedisSortedSetFlow builds a Redis sorted-set flow from a parsed
+// SortedSetConfig. The config is expected to have had ApplyDefaults applied
+// (LoadSortedSetConfig does this). workerPools resolves the named pool each
+// queue routes to; gateFactory, when non-nil, instantiates a per-queue gate for
+// any queue that declares a gate_type.
+func NewRedisSortedSetFlow(cfg SortedSetConfig, workerPools []pipeline.WorkerPoolConfig, gateFactory pipeline.GateFactory) (*RedisSortedSetFlow, error) {
+	redisOpts, err := ParseRedisOptions(cfg.URL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid Redis connection config: %w", err)
 	}
 	r := &RedisSortedSetFlow{
-		rdb:                     redis.NewClient(redisOpts),
-		requestChannels:         make([]requestChannelData, 0, len(configs)),
-		retryChannel:            make(chan pipeline.RetryMessage),
-		resultChannel:           make(chan api.ResultMessage, resultChannelBuffer),
-		pollInterval:            time.Duration(flowOpts.PollIntervalMs) * time.Millisecond,
-		batchSize:               flowOpts.BatchSize,
-		defaultRequestQueueName: flowOpts.RequestQueueName,
-		defaultResultQueueName:  flowOpts.ResultQueueName,
-	}
-
-	for _, fn := range fns {
-		fn(r)
+		rdb:                    redis.NewClient(redisOpts),
+		requestChannels:        make([]requestChannelData, 0, len(cfg.Queues)),
+		retryChannel:           make(chan pipeline.RetryMessage),
+		resultChannel:          make(chan api.ResultMessage, resultChannelBuffer),
+		pollInterval:           time.Duration(cfg.PollIntervalMs) * time.Millisecond,
+		batchSize:              cfg.BatchSize,
+		defaultResultQueueName: cfg.ResultQueueName,
+		workerPools:            workerPools,
+		gateFactory:            gateFactory,
+		enableTracing:          cfg.EnableTracing,
 	}
 
 	if r.enableTracing {
@@ -169,11 +129,34 @@ func NewRedisSortedSetFlow(flowOpts SortedSetFlowOptions, connOpts ConnectionOpt
 		}
 	}
 
-	r.configMap = make(map[string]queueConfig, len(configs))
-	for _, cfg := range configs {
+	// Retry messages that lack an explicit RequestQueueName fall back to this
+	// name when re-enqueued (flushRetryBatch). Default to the first configured
+	// queue so retries land on a real key rather than "" — preserving the
+	// previous single-queue fallback behavior.
+	if len(cfg.Queues) > 0 {
+		r.defaultRequestQueueName = cfg.Queues[0].QueueName
+	}
+
+	r.configMap = make(map[string]SortedSetQueueConfig, len(cfg.Queues))
+	for _, cfg := range cfg.Queues {
+		// Normalize before anything reads it: configMap is the source of the
+		// pool_name label on this queue's metrics, and an unset WorkerPoolID
+		// there would label them "" while the request channel below — and every
+		// pool-keyed series — says "default".
+		if cfg.WorkerPoolID == "" {
+			cfg.WorkerPoolID = "default"
+		}
+		workerPoolID := cfg.WorkerPoolID
+
 		var gate pipeline.Gate
 		if r.gateFactory != nil && cfg.GateType != "" {
-			gate, err = r.gateFactory.CreateGate(cfg.GateConfig)
+			gateCfg := cfg.GateConfig
+			gateCfg.Owner = pipeline.GateOwner{
+				QueueID:      cfg.ID,
+				QueueName:    cfg.QueueName,
+				WorkerPoolID: workerPoolID,
+			}
+			gate, err = r.gateFactory.CreateGate(gateCfg)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create gate for queue %q (gate_type=%q): %w", cfg.QueueName, cfg.GateType, err)
 			}
@@ -181,11 +164,6 @@ func NewRedisSortedSetFlow(flowOpts SortedSetFlowOptions, connOpts ConnectionOpt
 			gate = r.gate
 		} else {
 			gate = pipeline.ConstOpenGate()
-		}
-
-		workerPoolID := cfg.WorkerPoolID
-		if workerPoolID == "" {
-			workerPoolID = "default"
 		}
 
 		found := false
@@ -231,67 +209,6 @@ func NewRedisSortedSetFlow(flowOpts SortedSetFlowOptions, connOpts ConnectionOpt
 	}
 
 	return r, nil
-}
-
-func parseQueueConfigs(data []byte) ([]queueConfig, error) {
-	var configs []queueConfig
-	if err := json.Unmarshal(data, &configs); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal queues config: %w", err)
-	}
-	return configs, nil
-}
-
-func loadQueueConfigs(opts SortedSetFlowOptions) ([]queueConfig, error) {
-	var configs []queueConfig
-	if opts.QueuesConfig != "" {
-		var err error
-		configs, err = parseQueueConfigs([]byte(opts.QueuesConfig))
-		if err != nil {
-			return nil, err
-		}
-	} else if opts.QueuesConfigFile != "" {
-		data, err := os.ReadFile(opts.QueuesConfigFile)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read config file: %w", err)
-		}
-		configs, err = parseQueueConfigs(data)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		gateParams, err := parseGateParams(opts.GateParamsJSON)
-		if err != nil {
-			return nil, err
-		}
-		configs = []queueConfig{{
-			QueueName:          opts.RequestQueueName,
-			InferenceObjective: opts.InferenceObjective,
-			IGWBaseURL:         opts.IGWBaseURL,
-			RequestPathURL:     opts.RequestPathURL,
-			GateConfig:         pipeline.GateConfig{GateType: opts.GateType, GateParams: gateParams},
-			WorkerPoolID:       "default",
-		}}
-	}
-	seenID := make(map[string]bool, len(configs))
-	seenQueue := make(map[string]bool, len(configs))
-	for i := range configs {
-		applyQueueConfigDefaults(&configs[i])
-		if seenID[configs[i].ID] {
-			return nil, fmt.Errorf("duplicate queue id %q", configs[i].ID)
-		}
-		seenID[configs[i].ID] = true
-		if seenQueue[configs[i].QueueName] {
-			return nil, fmt.Errorf("duplicate queue_name %q", configs[i].QueueName)
-		}
-		seenQueue[configs[i].QueueName] = true
-	}
-	return configs, nil
-}
-
-func applyQueueConfigDefaults(cfg *queueConfig) {
-	if cfg.ID == "" {
-		cfg.ID = cfg.QueueName
-	}
 }
 
 func (r *RedisSortedSetFlow) Start(ctx context.Context) {
@@ -408,6 +325,8 @@ func (r *RedisSortedSetFlow) requestWorker(ctx context.Context, msgChannel chan 
 		gate = r.gate
 	}
 
+	metrics.InitGateDecisions(queueID, queueName, r.poolNameFor(queueID))
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -418,16 +337,36 @@ func (r *RedisSortedSetFlow) requestWorker(ctx context.Context, msgChannel chan 
 	}
 }
 
+// poolNameFor returns the worker pool a queue routes to, or "" when the queue has
+// no config entry (the metric label is then empty rather than wrong).
+func (r *RedisSortedSetFlow) poolNameFor(queueID string) string {
+	if cfg, ok := r.configMap[queueID]; ok {
+		return cfg.WorkerPoolID
+	}
+	return ""
+}
+
 func (r *RedisSortedSetFlow) processMessages(ctx context.Context, msgChannel chan *api.InternalRequest, queueName string, queueID string, gate pipeline.Gate, logger logr.Logger) {
 	currentTime := float64(time.Now().Unix())
 
 	budget := gate.Budget(ctx)
-	poolName := ""
-	if cfg, ok := r.configMap[queueID]; ok {
-		poolName = cfg.WorkerPoolID
-	}
+	poolName := r.poolNameFor(queueID)
 	metrics.SetDispatchBudget(budget, queueID, queueName, poolName)
 	batchSize := int(math.Floor(float64(r.batchSize) * budget))
+	if batchSize <= 0 {
+		// Back-pressure here is applied pre-dequeue: the budget shrank the batch
+		// to zero, so no message reaches gate.Apply below — the only other site
+		// that records a refusal. Count the throttled poll itself, or gate_closed
+		// stays silent exactly while the gate is doing its job (#368). Only count
+		// when work is actually waiting; an idle queue was not held back.
+		depth, err := r.rdb.ZCard(ctx, queueName).Result()
+		if err != nil {
+			logger.V(logutil.DEFAULT).Error(err, "Failed to read queue depth for a closed gate", "queue", queueName)
+		} else if depth > 0 {
+			metrics.RecordGateDecision(metrics.ReasonGateClosed, queueID, queueName, poolName)
+		}
+		return
+	}
 
 	for i := 0; i < batchSize; i++ {
 		results, err := r.rdb.ZPopMin(ctx, queueName, 1).Result()
