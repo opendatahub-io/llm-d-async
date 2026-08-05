@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/go-logr/logr"
 	"github.com/llm-d/llm-d-async/api"
 	"github.com/llm-d/llm-d-async/pipeline"
 	"github.com/llm-d/llm-d-async/pkg/metrics"
@@ -36,16 +37,27 @@ var _ pipeline.Gate = (*MetricDispatchGate)(nil)
 // formula N = max_SYS × (D − B) when threshold is set to the reserved baseline B.
 // On error or missing/invalid data, the gate returns the configured fallback budget.
 type MetricDispatchGate struct {
-	source    MetricSource
-	threshold float64
-	fallback  float64
-	poolLabel string
+	source        MetricSource
+	threshold     float64
+	fallback      float64
+	owner         pipeline.GateOwner
+	inferencePool string
 }
 
-// WithPoolLabel sets the pool name used to label the async_gate_metric_value and
-// async_gate_metric_threshold gauges this gate records on each evaluation.
-func (g *MetricDispatchGate) WithPoolLabel(pool string) *MetricDispatchGate {
-	g.poolLabel = pool
+// WithOwner sets the queue or worker pool this gate belongs to. Its
+// queue_id/queue_name/pool_name label the async_gate_metric_value and
+// async_gate_metric_threshold gauges, so they join with the owner's other
+// series (async_dispatch_budget, async_gate_decisions_total, ...).
+func (g *MetricDispatchGate) WithOwner(owner pipeline.GateOwner) *MetricDispatchGate {
+	g.owner = owner
+	return g
+}
+
+// WithInferencePool sets the InferencePool this gate queries, exposed as the
+// inference_pool label on the gauges above. It is what the gate measures, not
+// who it throttles — pool_name is the latter.
+func (g *MetricDispatchGate) WithInferencePool(pool string) *MetricDispatchGate {
+	g.inferencePool = pool
 	return g
 }
 
@@ -85,29 +97,37 @@ func (g *MetricDispatchGate) Budget(ctx context.Context) float64 {
 
 	samples, err := g.source.Query(ctx)
 	if err != nil {
-		logger.Error(err, "MetricSource error, using fallback value", "fallback", g.fallback)
-		return g.fallback
+		return g.useFallback(logger, fmt.Errorf("MetricSource error: %w", err))
 	}
 
 	if len(samples) == 0 {
-		logger.Error(fmt.Errorf("no metric samples found"), "using fallback value", "fallback", g.fallback)
-		return g.fallback
+		return g.useFallback(logger, fmt.Errorf("no metric samples found"))
 	}
 
 	value := samples[0].Value
 	if math.IsNaN(value) || math.IsInf(value, 0) {
-		logger.Error(fmt.Errorf("invalid metric value: %v", value), "using fallback value", "fallback", g.fallback)
-		return g.fallback
+		return g.useFallback(logger, fmt.Errorf("invalid metric value: %v", value))
 	}
 
 	// Expose the raw value and threshold so operators can see why the gate is
 	// open/closed (it closes when value <= threshold).
-	metrics.SetGateMetricValue(value, g.threshold, g.poolLabel)
+	metrics.SetGateMetricValue(value, g.threshold, g.owner.QueueID, g.owner.QueueName, g.owner.WorkerPoolID, g.inferencePool)
+	metrics.SetGateMetricSourceAvailable(true, g.owner.QueueID, g.owner.QueueName, g.owner.WorkerPoolID, g.inferencePool)
 
 	if value <= g.threshold {
 		return 0.0
 	}
 	return math.Min(1.0, math.Max(0.0, value-g.threshold))
+}
+
+// useFallback reports that this evaluation had no usable reading and returns the
+// configured fallback budget. Clearing async_gate_metric_source_available is what
+// lets an operator tell a fallback budget apart from a real reading of the same
+// number — most importantly a fallback of 0 from a genuinely saturated pool.
+func (g *MetricDispatchGate) useFallback(logger logr.Logger, err error) float64 {
+	metrics.SetGateMetricSourceAvailable(false, g.owner.QueueID, g.owner.QueueName, g.owner.WorkerPoolID, g.inferencePool)
+	logger.Error(err, "using fallback value", "fallback", g.fallback)
+	return g.fallback
 }
 
 // Apply implements pipeline.Gate.

@@ -763,15 +763,16 @@ func TestRetryMessage_retryAfterHonored(t *testing.T) {
 		Deadline: time.Now().Add(100 * time.Second).Unix(),
 	}, "", nil)
 
-	// Server says wait 30s; expBackoff for retry 1 would be ~[1,2) seconds,
-	// so the Retry-After value should win.
+	// Server says wait 30s; expBackoff for retry 1 jitters in [2,4), and the
+	// hint fits half the 100s deadline, so it wins — jittered up by <25% to
+	// spread messages rejected by the same event.
 	retryMessage(context.Background(), msg, retryChannel, resultChannel, 30*time.Second, asyncapi.InferenceResponse{})
 	if len(retryChannel) != 1 {
 		t.Fatalf("expected one message in retry channel, got %d", len(retryChannel))
 	}
 	retryMsg := <-retryChannel
-	if retryMsg.BackoffDurationSeconds < 30 {
-		t.Errorf("expected backoff >= 30s (Retry-After), got %f", retryMsg.BackoffDurationSeconds)
+	if retryMsg.BackoffDurationSeconds < 30 || retryMsg.BackoffDurationSeconds >= 37.5 {
+		t.Errorf("expected backoff in [30, 37.5) (jittered Retry-After), got %f", retryMsg.BackoffDurationSeconds)
 	}
 }
 
@@ -796,7 +797,7 @@ func TestRetryMessage_retryAfterIgnoredWhenSmaller(t *testing.T) {
 	}
 }
 
-func TestRetryMessage_retryAfterExceedsDeadline(t *testing.T) {
+func TestRetryMessage_retryAfterOversizedClampedNotTerminal(t *testing.T) {
 	retryChannel := make(chan pipeline.RetryMessage, 1)
 	resultChannel := make(chan asyncapi.ResultMessage, 1)
 	msg := newEmb(asyncapi.RequestMessage{
@@ -805,19 +806,44 @@ func TestRetryMessage_retryAfterExceedsDeadline(t *testing.T) {
 		Deadline: time.Now().Add(5 * time.Second).Unix(),
 	}, "", nil)
 
-	// Server says wait 30s, but deadline is only 5s away → deadline exceeded.
+	// Server says wait 30s, but the deadline is only 5s away. The hint is
+	// clamped rather than terminal: the server's estimate alone must not
+	// burn a message's remaining retry budget (it may be wrong, and the
+	// retry costs nothing durable). Clamped to half the deadline (2.5s),
+	// jittered to [2.5, 3.125), floored by the backoff sample [2, 4).
 	retryMessage(context.Background(), msg, retryChannel, resultChannel, 30*time.Second, asyncapi.InferenceResponse{})
-	if len(retryChannel) > 0 {
-		t.Errorf("should not retry when Retry-After exceeds deadline")
+	if len(resultChannel) > 0 {
+		t.Fatalf("message terminated early; want a scheduled retry")
 	}
-	if len(resultChannel) != 1 {
-		t.Fatalf("expected deadline-exceeded result, got %d messages", len(resultChannel))
+	if len(retryChannel) != 1 {
+		t.Fatalf("expected one message in retry channel, got %d", len(retryChannel))
 	}
-	result := <-resultChannel
-	var resultMap map[string]any
-	json.Unmarshal([]byte(result.Payload), &resultMap) // nolint:errcheck
-	if resultMap["error"] != "deadline exceeded" {
-		t.Errorf("expected 'deadline exceeded', got: %s", resultMap["error"])
+	retryMsg := <-retryChannel
+	if retryMsg.BackoffDurationSeconds < 2.5 || retryMsg.BackoffDurationSeconds >= 5 {
+		t.Errorf("backoff = %f, want clamped value in [2.5, 5)", retryMsg.BackoffDurationSeconds)
+	}
+}
+
+func TestRetryMessage_retryAfterClampedToHalfDeadline(t *testing.T) {
+	retryChannel := make(chan pipeline.RetryMessage, 1)
+	resultChannel := make(chan asyncapi.ResultMessage, 1)
+	msg := newEmb(asyncapi.RequestMessage{
+		ID:       "retry-after-clamped",
+		Created:  time.Now().Unix(),
+		Deadline: time.Now().Add(40 * time.Second).Unix(),
+	}, "", nil)
+
+	// Server says wait 300s with 40s to the deadline. The hint is clamped to
+	// half the remaining deadline (20s) and jittered to [20, 25) — the
+	// message waits as long as its budget allows instead of retrying against
+	// a saturated gateway on the backoff floor ([2, 4) at retry 1).
+	retryMessage(context.Background(), msg, retryChannel, resultChannel, 300*time.Second, asyncapi.InferenceResponse{})
+	if len(retryChannel) != 1 {
+		t.Fatalf("expected one message in retry channel, got %d", len(retryChannel))
+	}
+	retryMsg := <-retryChannel
+	if retryMsg.BackoffDurationSeconds < 20 || retryMsg.BackoffDurationSeconds >= 25 {
+		t.Errorf("backoff = %f, want clamped value in [20, 25)", retryMsg.BackoffDurationSeconds)
 	}
 }
 
@@ -2544,4 +2570,224 @@ func TestWorker_QueueGateAndPoolGateRace(t *testing.T) {
 	if atomic.LoadInt32(&poolReleaseCalled) != 1 {
 		t.Errorf("expected pool release to be called exactly once, got %d", poolReleaseCalled)
 	}
+}
+
+type mockDecisionPoolGate struct {
+	verdict pipeline.Verdict
+	err     error
+}
+
+func (g *mockDecisionPoolGate) Budget(ctx context.Context) float64 { return 1.0 }
+
+func (g *mockDecisionPoolGate) Apply(ctx context.Context, _ *asyncapi.InternalRequest, _ *[]pipeline.GateReleaseFunc) (pipeline.Verdict, error) {
+	return g.verdict, g.err
+}
+
+func gateDecisionCountForPool(poolID, reason string) float64 {
+	c, err := metrics.GateDecisions.GetMetricWithLabelValues("", "", poolID, reason)
+	if err != nil {
+		return 0
+	}
+	return testutil.ToFloat64(c)
+}
+
+func TestWorker_PoolGateDecisionsMetrics(t *testing.T) {
+	httpclient := NewTestClient(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
+	})
+	inferenceClient := NewHTTPInferenceClient(httpclient)
+
+	t.Run("dropped decision", func(t *testing.T) {
+		poolID := "pool-test-dropped"
+		metrics.InitGateDecisions("", "", poolID)
+		requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+		retryChannel := make(chan pipeline.RetryMessage, 1)
+		resultChannel := make(chan asyncapi.ResultMessage, 1)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		gate := &mockDecisionPoolGate{verdict: pipeline.Drop(nil)}
+		go WorkerWithGate(ctx, ctx, pipeline.Characteristics{}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil, gate)
+
+		msg := newEmb(asyncapi.RequestMessage{
+			ID:       "req-dropped",
+			Created:  time.Now().Unix(),
+			Deadline: time.Now().Add(30 * time.Second).Unix(),
+			Payload:  map[string]any{"model": "test"},
+		}, "http://localhost:30800/v1/completions", nil)
+		msg.WorkerPoolID = poolID
+		requestChannel <- msg
+
+		select {
+		case <-resultChannel:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for dropped result")
+		}
+
+		if got := gateDecisionCountForPool(poolID, metrics.ReasonDropped); got != 1 {
+			t.Errorf("GateDecisions[dropped] = %v, want 1", got)
+		}
+		for _, reason := range []string{metrics.ReasonGateClosed, metrics.ReasonQuotaExhausted, metrics.ReasonError} {
+			if got := gateDecisionCountForPool(poolID, reason); got != 0 {
+				t.Errorf("GateDecisions[%s] = %v, want 0", reason, got)
+			}
+		}
+	})
+
+	t.Run("refuse decision - gate_closed", func(t *testing.T) {
+		poolID := "pool-test-refused-closed"
+		metrics.InitGateDecisions("", "", poolID)
+		requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+		retryChannel := make(chan pipeline.RetryMessage, 1)
+		resultChannel := make(chan asyncapi.ResultMessage, 1)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		gate := &mockDecisionPoolGate{verdict: pipeline.Refuse()}
+		go WorkerWithGate(ctx, ctx, pipeline.Characteristics{}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil, gate)
+
+		msg := newEmb(asyncapi.RequestMessage{
+			ID:       "req-closed",
+			Created:  time.Now().Unix(),
+			Deadline: time.Now().Add(30 * time.Second).Unix(),
+			Payload:  map[string]any{"model": "test"},
+		}, "http://localhost:30800/v1/completions", nil)
+		msg.WorkerPoolID = poolID
+		requestChannel <- msg
+
+		select {
+		case <-retryChannel:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for retry message")
+		}
+
+		if got := gateDecisionCountForPool(poolID, metrics.ReasonGateClosed); got != 1 {
+			t.Errorf("GateDecisions[gate_closed] = %v, want 1", got)
+		}
+		for _, reason := range []string{metrics.ReasonDropped, metrics.ReasonQuotaExhausted, metrics.ReasonError} {
+			if got := gateDecisionCountForPool(poolID, reason); got != 0 {
+				t.Errorf("GateDecisions[%s] = %v, want 0", reason, got)
+			}
+		}
+	})
+
+	t.Run("refuse decision - quota_exhausted", func(t *testing.T) {
+		poolID := "pool-test-refused-quota"
+		metrics.InitGateDecisions("", "", poolID)
+		requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+		retryChannel := make(chan pipeline.RetryMessage, 1)
+		resultChannel := make(chan asyncapi.ResultMessage, 1)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		gate := &mockDecisionPoolGate{verdict: pipeline.Refuse()}
+		go WorkerWithGate(ctx, ctx, pipeline.Characteristics{}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil, gate)
+
+		ir := asyncapi.NewInternalRequest(
+			asyncapi.InternalRouting{RequestQueueName: "test-queue"},
+			&asyncapi.RequestMessage{
+				ID:       "req-quota",
+				Created:  time.Now().Unix(),
+				Deadline: time.Now().Add(30 * time.Second).Unix(),
+				Payload:  map[string]any{"model": "test"},
+			},
+		)
+		ir.SetClassification(asyncapi.ClassificationOverflow)
+
+		requestChannel <- pipeline.EmbelishedRequestMessage{
+			InternalRequest: ir,
+			RequestURL:      "http://localhost:30800/v1/completions",
+			WorkerPoolID:    poolID,
+		}
+
+		select {
+		case <-retryChannel:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for retry message")
+		}
+
+		if got := gateDecisionCountForPool(poolID, metrics.ReasonQuotaExhausted); got != 1 {
+			t.Errorf("GateDecisions[quota_exhausted] = %v, want 1", got)
+		}
+		for _, reason := range []string{metrics.ReasonGateClosed, metrics.ReasonDropped, metrics.ReasonError} {
+			if got := gateDecisionCountForPool(poolID, reason); got != 0 {
+				t.Errorf("GateDecisions[%s] = %v, want 0", reason, got)
+			}
+		}
+	})
+
+	t.Run("error decision", func(t *testing.T) {
+		poolID := "pool-test-error"
+		metrics.InitGateDecisions("", "", poolID)
+		requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+		retryChannel := make(chan pipeline.RetryMessage, 1)
+		resultChannel := make(chan asyncapi.ResultMessage, 1)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		gate := &mockDecisionPoolGate{err: fmt.Errorf("gate failure")}
+		go WorkerWithGate(ctx, ctx, pipeline.Characteristics{}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil, gate)
+
+		msg := newEmb(asyncapi.RequestMessage{
+			ID:       "req-error",
+			Created:  time.Now().Unix(),
+			Deadline: time.Now().Add(30 * time.Second).Unix(),
+			Payload:  map[string]any{"model": "test"},
+		}, "http://localhost:30800/v1/completions", nil)
+		msg.WorkerPoolID = poolID
+		requestChannel <- msg
+
+		select {
+		case <-resultChannel:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for error result")
+		}
+
+		if got := gateDecisionCountForPool(poolID, metrics.ReasonError); got != 1 {
+			t.Errorf("GateDecisions[error] = %v, want 1", got)
+		}
+		for _, reason := range []string{metrics.ReasonGateClosed, metrics.ReasonQuotaExhausted, metrics.ReasonDropped} {
+			if got := gateDecisionCountForPool(poolID, reason); got != 0 {
+				t.Errorf("GateDecisions[%s] = %v, want 0", reason, got)
+			}
+		}
+	})
+
+	t.Run("wait decision - counts once per message", func(t *testing.T) {
+		poolID := "pool-test-wait"
+		metrics.InitGateDecisions("", "", poolID)
+		requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+		retryChannel := make(chan pipeline.RetryMessage, 1)
+		resultChannel := make(chan asyncapi.ResultMessage, 1)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		gate := &mockDecisionPoolGate{verdict: pipeline.Wait()}
+		go WorkerWithGate(ctx, ctx, pipeline.Characteristics{}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil, gate)
+
+		msg := newEmb(asyncapi.RequestMessage{
+			ID:       "req-wait",
+			Created:  time.Now().Unix(),
+			Deadline: time.Now().Add(30 * time.Second).Unix(),
+			Payload:  map[string]any{"model": "test"},
+		}, "http://localhost:30800/v1/completions", nil)
+		msg.WorkerPoolID = poolID
+		requestChannel <- msg
+
+		time.Sleep(250 * time.Millisecond)
+
+		if got := gateDecisionCountForPool(poolID, metrics.ReasonGateClosed); got != 1 {
+			t.Errorf("GateDecisions[gate_closed] = %v, want 1 after multiple wait intervals", got)
+		}
+		for _, reason := range []string{metrics.ReasonQuotaExhausted, metrics.ReasonDropped, metrics.ReasonError} {
+			if got := gateDecisionCountForPool(poolID, reason); got != 0 {
+				t.Errorf("GateDecisions[%s] = %v, want 0", reason, got)
+			}
+		}
+	})
 }
