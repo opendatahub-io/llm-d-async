@@ -7,8 +7,11 @@ import (
 	"strconv"
 	"sync"
 
+	"golang.org/x/net/http/httpguts"
+
 	"github.com/llm-d/llm-d-async/api"
 	"github.com/llm-d/llm-d-async/pipeline"
+	"github.com/llm-d/llm-d-async/pkg/async/mergepolicy/internal/fairness"
 	"github.com/llm-d/llm-d-async/pkg/metrics"
 	"github.com/llm-d/llm-d-async/pkg/plugins"
 )
@@ -18,6 +21,7 @@ func init() {
 		var params struct {
 			PriorityHeader string `json:"priority_header"`
 			TierLabel      string `json:"tier_label"`
+			fairness.Params
 		}
 		if len(parameters) > 0 {
 			if err := json.Unmarshal(parameters, &params); err != nil {
@@ -27,21 +31,54 @@ func init() {
 		if params.PriorityHeader == "" {
 			params.PriorityHeader = "x-gateway-priority"
 		}
-		if params.TierLabel == "" {
-			params.TierLabel = "tier"
+		// An illegal header name is one net/http refuses to write, which would
+		// fail every dispatched request permanently; surface it at startup.
+		if !httpguts.ValidHeaderFieldName(params.PriorityHeader) {
+			return nil, fmt.Errorf("invalid tier-priority parameters: priority_header %q is not a legal HTTP header name", params.PriorityHeader)
 		}
-		return NewTierPriorityPolicy(name, params.PriorityHeader, params.TierLabel), nil
+		fairnessHeader, err := params.ResolveHeader()
+		if err != nil {
+			return nil, fmt.Errorf("invalid tier-priority parameters: %w", err)
+		}
+		return NewTierPriorityPolicy(name, Config{
+			PriorityHeader:    params.PriorityHeader,
+			TierLabel:         params.TierLabel,
+			FairnessHeader:    fairnessHeader,
+			FairnessAttribute: params.Attribute,
+		}), nil
 	})
 }
 
-func NewTierPriorityPolicy(name string, priorityHeader string, tierLabel string) *TierPriorityPolicy {
+// Config configures the tier-priority merge policy. The zero Config disables
+// both the priority header and fairness stamping.
+type Config struct {
+	// PriorityHeader is the HTTP header stamped with the computed priority
+	// index. Empty disables the priority header.
+	PriorityHeader string
+	// TierLabel is the InternalRequest label holding the request's priority
+	// tier. Empty falls back to "tier".
+	TierLabel string
+	// FairnessHeader is the HTTP header stamped with the tenant identity so the
+	// gateway's flow control can arbitrate between tenants. Empty disables
+	// stamping.
+	FairnessHeader string
+	// FairnessAttribute is the message metadata attribute holding the tenant
+	// identity. Empty falls back to fairness.DefaultAttribute.
+	FairnessAttribute string
+}
+
+// NewTierPriorityPolicy returns a merge policy that buckets requests into strict
+// priority lanes and round-robins across client channels within each lane.
+func NewTierPriorityPolicy(name string, cfg Config) *TierPriorityPolicy {
+	tierLabel := cfg.TierLabel
 	if tierLabel == "" {
 		tierLabel = "tier"
 	}
 	return &TierPriorityPolicy{
 		name:           name,
-		priorityHeader: priorityHeader,
+		priorityHeader: cfg.PriorityHeader,
 		tierLabel:      tierLabel,
+		fairness:       fairness.New(cfg.FairnessHeader, cfg.FairnessAttribute),
 	}
 }
 
@@ -52,6 +89,7 @@ type TierPriorityPolicy struct {
 	name           string
 	priorityHeader string
 	tierLabel      string
+	fairness       fairness.Stamper
 }
 
 func (p *TierPriorityPolicy) TypedName() plugins.TypedName {
@@ -263,7 +301,7 @@ func (p *TierPriorityPolicy) MergeRequestChannels(channels []pipeline.RequestCha
 			}(ch, s)
 		}
 
-		go func(workerPoolID string, s *scheduler, mergedChannel chan pipeline.EmbelishedRequestMessage, priorityHeader string, tierLabel string) {
+		go func(workerPoolID string, s *scheduler, mergedChannel chan pipeline.EmbelishedRequestMessage, priorityHeader string, tierLabel string, fairnessStamper fairness.Stamper) {
 			defer close(mergedChannel)
 			defer s.Close()
 			for {
@@ -288,6 +326,9 @@ func (p *TierPriorityPolicy) MergeRequestChannels(channels []pipeline.RequestCha
 				for k, v := range ir.PublicRequest.ReqHeaders() {
 					headers[k] = v
 				}
+				// Stamped after the caller's headers so the tenant the quota
+				// gate accounts on is the one the gateway arbitrates on.
+				fairnessStamper.Stamp(headers, ir.PublicRequest)
 
 				pri := getPriorityIndex(ir, tierLabel)
 				if priorityHeader != "" {
@@ -303,7 +344,7 @@ func (p *TierPriorityPolicy) MergeRequestChannels(channels []pipeline.RequestCha
 				metrics.IncQueueDepth(ir.QueueID, ir.RequestQueueName, workerPoolID)
 				mergedChannel <- erm
 			}
-		}(workerPoolID, s, mergedChannel, p.priorityHeader, p.tierLabel)
+		}(workerPoolID, s, mergedChannel, p.priorityHeader, p.tierLabel, p.fairness)
 	}
 
 	return dispatch
