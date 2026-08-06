@@ -417,3 +417,27 @@ tests:
       - notContains:
           path: spec.template.spec.containers[0].args
           content: --transform-config-file=/etc/llm-d-async/config/transform-config.json
+
+  - it: should not render affinity by default
+    asserts:
+      - isNull:
+          path: spec.template.spec.affinity
+
+  - it: should render affinity when set
+    set:
+      ap.affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/infra
+                    operator: Exists
+    asserts:
+      - equal:
+          path: spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key
+          value: node-role.kubernetes.io/infra
+      - equal:
+          path: spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator
+          value: Exists
+      - notExists:
+          path: spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values
