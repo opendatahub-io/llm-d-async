@@ -675,6 +675,7 @@ The Async Processor exposes Prometheus metrics under the `llm_d_async` subsystem
 |--------|------|-------------|
 | `llm_d_async_async_request_total` | Counter | New async requests (first attempt only) |
 | `llm_d_async_async_successful_requests_total` | Counter | Requests that received a successful inference response |
+| `llm_d_async_async_tokens_total` | Counter | Tokens processed by successfully-dispatched requests, by `direction`: `input` (prompt_tokens) and `output` (completion_tokens). Parsed best-effort from the OpenAI `usage` object in 2xx response bodies; no-op when usage is absent or the body is not parseable (e.g. streaming responses). Non-OpenAI gateways undercount by design. |
 | `llm_d_async_async_failed_requests_total` | Counter | Requests that failed with a fatal or non-retryable error |
 | `llm_d_async_async_shedded_requests_total` | Counter | Requests shedded due to rate limiting (429 / capacity) |
 | `llm_d_async_async_exceeded_deadline_requests_total` | Counter | Requests that exceeded their deadline before completion |
@@ -697,6 +698,7 @@ The Async Processor exposes Prometheus metrics under the `llm_d_async` subsystem
 | `pool_name` | Worker pool the queue routes to (`async_pool_worker_limit` carries only this label) |
 | `reason` | Gate-decision reason (only on `async_gate_decisions_total`): `gate_closed`, `quota_exhausted`, `dropped`, `error` |
 | `inference_pool` | InferencePool a gate queries (only on the two `async_gate_metric_*` gauges), from the gate's `pool` param. Empty when the gate does not name one. |
+| `direction` | Token direction (only on `async_tokens_total`): `input` or `output` |
 
 `pool_name` always names the **async worker pool** that owns the series, never the
 InferencePool a gate happens to query — that is what `inference_pool` is for. Every

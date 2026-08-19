@@ -1431,6 +1431,222 @@ func TestMetrics_SuccessfulRequest(t *testing.T) {
 	}
 }
 
+func TestMetrics_SuccessfulRequestRecordsTokens(t *testing.T) {
+	queueID := "tokens-success-qid"
+	queueName := "tokens-success-queue"
+	metrics.Tokens.Reset()
+
+	httpclient := NewTestClient(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewBufferString(`{"usage":{"prompt_tokens":25,"completion_tokens":13}}`)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	inferenceClient := NewHTTPInferenceClient(httpclient)
+	requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+	retryChannel := make(chan pipeline.RetryMessage, 1)
+	resultChannel := make(chan asyncapi.ResultMessage, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	go Worker(ctx, ctx, pipeline.Characteristics{HasExternalBackoff: false}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil)
+
+	requestChannel <- newEmbR(asyncapi.InternalRouting{
+		QueueID:          queueID,
+		RequestQueueName: queueName,
+	}, asyncapi.RequestMessage{
+		ID:       "m-tokens",
+		Created:  time.Now().Unix(),
+		Deadline: time.Now().Add(100 * time.Second).Unix(),
+		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+	}, "http://localhost:30800/v1/completions", nil)
+
+	select {
+	case <-resultChannel:
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+
+	if got := testutil.ToFloat64(metrics.Tokens.WithLabelValues(queueID, queueName, "test-pool", "input")); got != 25 {
+		t.Errorf("input tokens = %v, want 25", got)
+	}
+	if got := testutil.ToFloat64(metrics.Tokens.WithLabelValues(queueID, queueName, "test-pool", "output")); got != 13 {
+		t.Errorf("output tokens = %v, want 13", got)
+	}
+}
+
+func TestMetrics_PromptOnlyUsageRegistersBothDirections(t *testing.T) {
+	queueID := "tokens-prompt-qid"
+	queueName := "tokens-prompt-queue"
+	metrics.Tokens.Reset()
+
+	httpclient := NewTestClient(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewBufferString(`{"usage":{"prompt_tokens":7}}`)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	inferenceClient := NewHTTPInferenceClient(httpclient)
+	requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+	retryChannel := make(chan pipeline.RetryMessage, 1)
+	resultChannel := make(chan asyncapi.ResultMessage, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	go Worker(ctx, ctx, pipeline.Characteristics{HasExternalBackoff: false}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil)
+
+	requestChannel <- newEmbR(asyncapi.InternalRouting{
+		QueueID:          queueID,
+		RequestQueueName: queueName,
+	}, asyncapi.RequestMessage{
+		ID:       "m-prompt",
+		Created:  time.Now().Unix(),
+		Deadline: time.Now().Add(100 * time.Second).Unix(),
+		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+	}, "http://localhost:30800/v1/completions", nil)
+
+	select {
+	case <-resultChannel:
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+
+	if got := testutil.ToFloat64(metrics.Tokens.WithLabelValues(queueID, queueName, "test-pool", "input")); got != 7 {
+		t.Errorf("input tokens = %v, want 7", got)
+	}
+	if got := testutil.ToFloat64(metrics.Tokens.WithLabelValues(queueID, queueName, "test-pool", "output")); got != 0 {
+		t.Errorf("output tokens = %v, want 0 (series must be registered)", got)
+	}
+}
+
+func TestMetrics_NoUsageRecordsNoTokens(t *testing.T) {
+	queueID := "tokens-nousage-qid"
+	queueName := "tokens-nousage-queue"
+	metrics.Tokens.Reset()
+
+	httpclient := NewTestClient(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewBufferString(`{"choices":[{"text":"hi"}]}`)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	inferenceClient := NewHTTPInferenceClient(httpclient)
+	requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+	retryChannel := make(chan pipeline.RetryMessage, 1)
+	resultChannel := make(chan asyncapi.ResultMessage, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	go Worker(ctx, ctx, pipeline.Characteristics{HasExternalBackoff: false}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil)
+
+	requestChannel <- newEmbR(asyncapi.InternalRouting{
+		QueueID:          queueID,
+		RequestQueueName: queueName,
+	}, asyncapi.RequestMessage{
+		ID:       "m-nousage",
+		Created:  time.Now().Unix(),
+		Deadline: time.Now().Add(100 * time.Second).Unix(),
+		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+	}, "http://localhost:30800/v1/completions", nil)
+
+	select {
+	case <-resultChannel:
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+
+	if got := testutil.CollectAndCount(metrics.Tokens, "llm_d_async_async_tokens_total"); got != 0 {
+		t.Errorf("tokens series count = %d, want 0 (usage absent)", got)
+	}
+}
+
+func TestMetrics_NonOpenAIEndpointNotTokenized(t *testing.T) {
+	queueID := "tokens-otherurl-qid"
+	queueName := "tokens-otherurl-queue"
+	metrics.Tokens.Reset()
+
+	httpclient := NewTestClient(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewBufferString(`{"usage":{"prompt_tokens":25,"completion_tokens":13}}`)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	inferenceClient := NewHTTPInferenceClient(httpclient)
+	requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+	retryChannel := make(chan pipeline.RetryMessage, 1)
+	resultChannel := make(chan asyncapi.ResultMessage, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	go Worker(ctx, ctx, pipeline.Characteristics{HasExternalBackoff: false}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil)
+
+	requestChannel <- newEmbR(asyncapi.InternalRouting{
+		QueueID:          queueID,
+		RequestQueueName: queueName,
+	}, asyncapi.RequestMessage{
+		ID:       "m-otherurl",
+		Created:  time.Now().Unix(),
+		Deadline: time.Now().Add(100 * time.Second).Unix(),
+		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+	}, "http://localhost:30800/v1/embeddings", nil)
+
+	select {
+	case <-resultChannel:
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+
+	if got := testutil.CollectAndCount(metrics.Tokens, "llm_d_async_async_tokens_total"); got != 0 {
+		t.Errorf("tokens series count = %d, want 0 (non-OpenAI endpoint)", got)
+	}
+}
+
+func TestMetrics_RedirectNotTokenized(t *testing.T) {
+	queueID := "tokens-3xx-qid"
+	queueName := "tokens-3xx-queue"
+	metrics.Tokens.Reset()
+
+	httpclient := NewTestClient(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusFound,
+			Body:       io.NopCloser(bytes.NewBufferString(`{"usage":{"prompt_tokens":25,"completion_tokens":13}}`)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	inferenceClient := NewHTTPInferenceClient(httpclient)
+	requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+	retryChannel := make(chan pipeline.RetryMessage, 1)
+	resultChannel := make(chan asyncapi.ResultMessage, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	go Worker(ctx, ctx, pipeline.Characteristics{HasExternalBackoff: false}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil)
+
+	requestChannel <- newEmbR(asyncapi.InternalRouting{
+		QueueID:          queueID,
+		RequestQueueName: queueName,
+	}, asyncapi.RequestMessage{
+		ID:       "m-3xx",
+		Created:  time.Now().Unix(),
+		Deadline: time.Now().Add(100 * time.Second).Unix(),
+		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+	}, "http://localhost:30800/v1/completions", nil)
+
+	select {
+	case <-resultChannel:
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+
+	if got := testutil.CollectAndCount(metrics.Tokens, "llm_d_async_async_tokens_total"); got != 0 {
+		t.Errorf("tokens series count = %d, want 0 (3xx not tokenized)", got)
+	}
+}
+
 func TestMetrics_RateLimited(t *testing.T) {
 	queueID := "metrics-shedded-qid"
 	queueName := "metrics-shedded-queue"

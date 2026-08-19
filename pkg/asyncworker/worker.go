@@ -284,6 +284,14 @@ func WorkerWithGate(consumeCtx, requestCtx context.Context, characteristics pipe
 
 					if err == nil {
 						metrics.RecordSuccessfulReq(queueID, queueName, msg.WorkerPoolID)
+						// SendRequest treats 3xx as success too, so token
+						// recording is gated on a strict 2xx: usage is only
+						// meaningful for real completions.
+						if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+							if input, output, ok := ParseUsage(resp.Body, msg.RequestURL); ok {
+								metrics.RecordTokens(input, output, queueID, queueName, msg.WorkerPoolID)
+							}
+						}
 						select {
 						case resultChannel <- asyncapi.NewHTTPResult(msg.PublicRequest, msg.InternalRouting, resp.StatusCode, resp.Body):
 						case <-requestCtx.Done():
