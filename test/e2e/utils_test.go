@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -11,9 +12,13 @@ import (
 	"strconv"
 	"time"
 
+	"cloud.google.com/go/pubsub/v2"
+	"cloud.google.com/go/pubsub/v2/apiv1/pubsubpb"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/llm-d/llm-d-async/api"
 )
@@ -44,6 +49,17 @@ const (
 
 	benchmarkPoolGateRequestQueue = "benchmark-pool-gate-request-sortedset"
 	benchmarkPoolGateResultQueue  = "benchmark-pool-gate-result-list"
+
+	pubsubProjectID    = "test-project"
+	pubsubRequestTopic = "pubsub-e2e-request-topic"
+	pubsubRequestSub   = "pubsub-e2e-request-sub"
+	pubsubResultTopic  = "pubsub-e2e-result-topic"
+	pubsubResultSub    = "pubsub-e2e-result-sub"
+
+	pubsubBenchRequestTopic = "pubsub-bench-request-topic"
+	pubsubBenchRequestSub   = "pubsub-bench-request-sub"
+	pubsubBenchResultTopic  = "pubsub-bench-result-topic"
+	pubsubBenchResultSub    = "pubsub-bench-result-sub"
 )
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
@@ -103,6 +119,87 @@ func popResult(ctx context.Context, rdb *redis.Client, queue string) *api.Result
 	var msg api.ResultMessage
 	gomega.ExpectWithOffset(1, json.Unmarshal([]byte(val), &msg)).To(gomega.Succeed())
 	return &msg
+}
+
+func enqueuePubSubMessage(ctx context.Context, client *pubsub.Client, topic string, msg api.RequestMessage) {
+	data, err := json.Marshal(msg)
+	gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred())
+	pubMsg := &pubsub.Message{
+		Data: data,
+	}
+	if msg.Metadata != nil {
+		pubMsg.Attributes = msg.Metadata
+	}
+	res := client.Publisher(topic).Publish(ctx, pubMsg)
+	_, err = res.Get(ctx)
+	gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred())
+}
+
+// enqueuePubSubMessages enqueues multiple messages to a PubSub topic. It publishes
+// all messages concurrently before waiting on publish results, allowing the SDK's
+// internal bundler to batch requests into efficient RPCs for bulk benchmarks (e.g. 5,000 msgs)
+// without blocking sequentially on each message round-trip.
+func enqueuePubSubMessages(ctx context.Context, client *pubsub.Client, topic string, msgs ...api.RequestMessage) {
+	publisher := client.Publisher(topic)
+	results := make([]*pubsub.PublishResult, len(msgs))
+	for i, msg := range msgs {
+		data, err := json.Marshal(msg)
+		gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred())
+		pubMsg := &pubsub.Message{
+			Data: data,
+		}
+		if msg.Metadata != nil {
+			pubMsg.Attributes = msg.Metadata
+		}
+		results[i] = publisher.Publish(ctx, pubMsg)
+	}
+	for _, res := range results {
+		_, err := res.Get(ctx)
+		gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred())
+	}
+}
+
+func popPubSubResult(ctx context.Context, client *pubsub.Client, subName string) *api.ResultMessage {
+	sub := client.Subscriber(subName)
+	sub.ReceiveSettings.MaxOutstandingMessages = 1
+	sub.ReceiveSettings.NumGoroutines = 1
+
+	cctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+
+	var result *api.ResultMessage
+	err := sub.Receive(cctx, func(rctx context.Context, msg *pubsub.Message) {
+		if result == nil {
+			var r api.ResultMessage
+			if err := json.Unmarshal(msg.Data, &r); err != nil {
+				ginkgo.GinkgoLogr.V(1).Info("popPubSubResult unmarshal error", "error", err, "sub", subName)
+			} else {
+				result = &r
+			}
+			msg.Ack()
+			cancel()
+			return
+		}
+		msg.Nack()
+	})
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		ginkgo.GinkgoLogr.V(1).Info("popPubSubResult receive error", "error", err, "sub", subName)
+	}
+	return result
+}
+
+func recreatePubSubSubscription(ctx context.Context, client *pubsub.Client, projectID, subID, topicID string) {
+	subName := fmt.Sprintf("projects/%s/subscriptions/%s", projectID, subID)
+	topicName := fmt.Sprintf("projects/%s/topics/%s", projectID, topicID)
+	err := client.SubscriptionAdminClient.DeleteSubscription(ctx, &pubsubpb.DeleteSubscriptionRequest{Subscription: subName})
+	if err != nil && status.Code(err) != codes.NotFound {
+		gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred())
+	}
+	_, err = client.SubscriptionAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
+		Name:  subName,
+		Topic: topicName,
+	})
+	gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred())
 }
 
 func makeRequestMessage(id string, deadlineOffset time.Duration) api.RequestMessage {
