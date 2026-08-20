@@ -113,6 +113,26 @@ func TestGetAsyncProcessorCollectors_includesGateDecisions(t *testing.T) {
 	}
 }
 
+func TestGetAsyncProcessorCollectors_includesTokens(t *testing.T) {
+	for _, withLatency := range []bool{false, true} {
+		collectors := GetAsyncProcessorCollectors(withLatency)
+		if !containsCollector(collectors, Tokens) {
+			t.Errorf("expected Tokens to be present (supportsMessageLatency=%v)", withLatency)
+		}
+	}
+}
+
+func TestRecordTokens(t *testing.T) {
+	Tokens.Reset()
+	RecordTokens(25, 13, "q1", "queue-1", "pool-a")
+	if got := testutil.ToFloat64(Tokens.WithLabelValues("q1", "queue-1", "pool-a", "input")); got != 25 {
+		t.Errorf("input tokens = %v, want 25", got)
+	}
+	if got := testutil.ToFloat64(Tokens.WithLabelValues("q1", "queue-1", "pool-a", "output")); got != 13 {
+		t.Errorf("output tokens = %v, want 13", got)
+	}
+}
+
 func containsCollector(collectors []prometheus.Collector, target prometheus.Collector) bool {
 	for _, c := range collectors {
 		if c == target {

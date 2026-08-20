@@ -16,6 +16,7 @@ const (
 	LabelQueueName = "queue_name"
 	LabelPoolName  = "pool_name"
 	LabelReason    = "reason"
+	LabelDirection = "direction"
 
 	// LabelInferencePool names the InferencePool a gate queries. It is distinct
 	// from pool_name, which always names the async worker pool that owns the
@@ -56,6 +57,10 @@ var (
 		Subsystem: SchedulerSubsystem, Name: "async_shedded_requests_total",
 		Help: "Total number of async requests that were shedded.",
 	}, queueLabels)
+	Tokens = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: SchedulerSubsystem, Name: "async_tokens_total",
+		Help: "Total number of tokens processed by successfully-dispatched requests, parsed best-effort from the OpenAI usage object in 2xx response bodies (direction=input maps prompt_tokens, direction=output maps completion_tokens). No-op when usage is absent or the body is not parseable (e.g. streaming responses); non-OpenAI gateways undercount by design.",
+	}, []string{LabelQueueID, LabelQueueName, LabelPoolName, LabelDirection})
 	MessageLatencyTime = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Subsystem: SchedulerSubsystem, Name: "async_message_latency_time_millis",
 		Help:    "Time from message publish to message being successfully processed.",
@@ -160,6 +165,12 @@ func RecordSheddedReq(queueID, queueName, poolName string) {
 	SheddedRequests.WithLabelValues(queueID, queueName, poolName).Inc()
 }
 
+// RecordTokens increments the token counters for both directions.
+func RecordTokens(inputTokens, outputTokens int64, queueID, queueName, poolName string) {
+	Tokens.WithLabelValues(queueID, queueName, poolName, "input").Add(float64(inputTokens))
+	Tokens.WithLabelValues(queueID, queueName, poolName, "output").Add(float64(outputTokens))
+}
+
 func RecordMessageLatency(millis float64, queueID, queueName, poolName string) {
 	MessageLatencyTime.WithLabelValues(queueID, queueName, poolName).Observe(millis)
 }
@@ -253,7 +264,7 @@ func SetGateMetricSourceAvailable(available bool, queueID, queueName, poolName, 
 // GetCollectors returns all custom collectors for the async processor.
 func GetAsyncProcessorCollectors(supportsMessageLatency bool) []prometheus.Collector {
 	collectors := []prometheus.Collector{
-		Retries, AsyncReqs, ExceededDeadlineReqs, FailedReqs, SuccessfulReqs, SheddedRequests,
+		Retries, AsyncReqs, ExceededDeadlineReqs, FailedReqs, SuccessfulReqs, SheddedRequests, Tokens,
 		QueueDepth, InflightRequests, BrokerBacklog, InferenceLatencyTime, QueueResidenceTime,
 		DispatchBudget, PoolWorkerLimit, GateDecisions,
 		GateMetricValue, GateMetricThreshold, GateMetricSourceAvailable,
