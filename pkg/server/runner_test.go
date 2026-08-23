@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -13,6 +14,11 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/llm-d/llm-d-async/pipeline"
+	"github.com/llm-d/llm-d-async/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 func generateTestCert(t *testing.T, dir string) (caPath, certPath, keyPath string) {
@@ -221,4 +227,110 @@ func TestBuildTLSConfig_invalidCertKeyPair(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for invalid cert/key pair")
 	}
+}
+
+type fakeBacklogReporter struct {
+	stats []pipeline.QueueBacklogStat
+	err   error
+}
+
+func (f *fakeBacklogReporter) QueueBacklog(context.Context) ([]pipeline.QueueBacklogStat, error) {
+	return f.stats, f.err
+}
+
+func histogramSampleCount(c prometheus.Collector) uint64 {
+	ch := make(chan prometheus.Metric, 64)
+	c.Collect(ch)
+	close(ch)
+	var total uint64
+	for m := range ch {
+		var dto dto.Metric
+		// nolint:errcheck
+		m.Write(&dto)
+		total += dto.GetHistogram().GetSampleCount()
+	}
+	return total
+}
+
+func TestPollBacklogObservesDeadlineViews(t *testing.T) {
+	metrics.DeadlineProximity.Reset()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Cumulative counts for buckets 0, 1s, ..., 24h (see
+	// metrics.DeadlineProximityBucketLabels). Every poll replaces the
+	// snapshot, so the final state is deterministic regardless of tick count.
+	labels := metrics.DeadlineProximityBucketLabels()
+	cumulative := []int64{1, 2, 2, 2, 3, 3, 3, 4, 5, 6, 7, 7, 8, 9}
+	counts := make([]pipeline.ExpiringCount, 0, len(labels))
+	for i, l := range labels {
+		counts = append(counts, pipeline.ExpiringCount{Window: l, Count: cumulative[i]})
+	}
+	reporter := &fakeBacklogReporter{stats: []pipeline.QueueBacklogStat{{
+		QueueID:        "q1",
+		QueueName:      "queue-1",
+		PoolName:       "pool-a",
+		Depth:          2,
+		ExpiringCounts: counts,
+	}}}
+	go pollBacklog(ctx, reporter, 10*time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+
+	if got := histogramSampleCount(metrics.DeadlineProximity); got != 9 {
+		t.Fatalf("DeadlineProximity sample count = %d, want 9", got)
+	}
+	h := histogramFor(t, metrics.DeadlineProximity, map[string]string{
+		"queue_id": "q1", "queue_name": "queue-1", "pool_name": "pool-a",
+	})
+	if got := h.GetSampleSum(); got != 72983000 {
+		t.Errorf("sample sum = %v, want 72983000", got)
+	}
+	if len(h.GetBucket()) != 14 {
+		t.Errorf("bucket count = %d, want 14", len(h.GetBucket()))
+	}
+}
+
+func TestPollBacklogSkipsNilDeadlineViews(t *testing.T) {
+	metrics.DeadlineProximity.Reset()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reporter := &fakeBacklogReporter{stats: []pipeline.QueueBacklogStat{{
+		QueueID:   "q1",
+		QueueName: "queue-1",
+		PoolName:  "pool-a",
+		Depth:     5,
+	}}}
+	go pollBacklog(ctx, reporter, 10*time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+
+	if got := histogramSampleCount(metrics.DeadlineProximity); got != 0 {
+		t.Fatalf("DeadlineProximity sample count = %d, want 0", got)
+	}
+}
+
+// histogramFor gathers a collector and returns the histogram whose labels
+// match wantLabels.
+func histogramFor(t *testing.T, c prometheus.Collector, wantLabels map[string]string) *dto.Histogram {
+	t.Helper()
+	ch := make(chan prometheus.Metric, 64)
+	c.Collect(ch)
+	close(ch)
+	for m := range ch {
+		var dto dto.Metric
+		// nolint:errcheck
+		m.Write(&dto)
+		matches := true
+		for _, lp := range dto.GetLabel() {
+			if want, ok := wantLabels[lp.GetName()]; !ok || lp.GetValue() != want {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return dto.GetHistogram()
+		}
+	}
+	t.Fatalf("no histogram matched labels %v", wantLabels)
+	return nil
 }

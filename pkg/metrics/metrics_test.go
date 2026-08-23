@@ -1,10 +1,13 @@
 package metrics
 
 import (
+	"sort"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 )
 
 func TestGetAsyncProcessorCollectors_withoutLatency(t *testing.T) {
@@ -122,6 +125,15 @@ func TestGetAsyncProcessorCollectors_includesTokens(t *testing.T) {
 	}
 }
 
+func TestGetAsyncProcessorCollectors_includesDeadlineProximity(t *testing.T) {
+	for _, withLatency := range []bool{false, true} {
+		collectors := GetAsyncProcessorCollectors(withLatency)
+		if !containsCollector(collectors, DeadlineProximity) {
+			t.Errorf("expected DeadlineProximity to be present (supportsMessageLatency=%v)", withLatency)
+		}
+	}
+}
+
 func TestRecordTokens(t *testing.T) {
 	Tokens.Reset()
 	RecordTokens(25, 13, "q1", "queue-1", "pool-a")
@@ -131,6 +143,129 @@ func TestRecordTokens(t *testing.T) {
 	if got := testutil.ToFloat64(Tokens.WithLabelValues("q1", "queue-1", "pool-a", "output")); got != 13 {
 		t.Errorf("output tokens = %v, want 13", got)
 	}
+}
+
+// The bucket boundaries and their le labels define the histogram shape fed by
+// the backlog poller, so both must be stable and in ascending order.
+func TestDeadlineProximityBuckets(t *testing.T) {
+	want := []time.Duration{0, time.Second, 5 * time.Second, 15 * time.Second, 30 * time.Second,
+		time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute, 30 * time.Minute,
+		time.Hour, 2 * time.Hour, 6 * time.Hour, 24 * time.Hour}
+	buckets := DeadlineProximityBuckets()
+	if len(buckets) != len(want) {
+		t.Fatalf("len(DeadlineProximityBuckets()) = %d, want %d", len(buckets), len(want))
+	}
+	for i, w := range want {
+		if buckets[i] != w {
+			t.Errorf("DeadlineProximityBuckets()[%d] = %v, want %v", i, buckets[i], w)
+		}
+	}
+	if !sort.SliceIsSorted(buckets, func(i, j int) bool { return buckets[i] < buckets[j] }) {
+		t.Error("DeadlineProximityBuckets() is not ascending")
+	}
+
+	wantLabels := []string{"0", "1000", "5000", "15000", "30000", "60000", "120000",
+		"300000", "600000", "1800000", "3600000", "7200000", "21600000", "86400000"}
+	labels := DeadlineProximityBucketLabels()
+	if len(labels) != len(wantLabels) {
+		t.Fatalf("len(DeadlineProximityBucketLabels()) = %d, want %d", len(labels), len(wantLabels))
+	}
+	for i, l := range wantLabels {
+		if labels[i] != l {
+			t.Errorf("DeadlineProximityBucketLabels()[%d] = %q, want %q", i, labels[i], l)
+		}
+	}
+
+	// Mutating the returned copies must not affect subsequent callers.
+	buckets[0] = 99
+	if got := DeadlineProximityBuckets()[0]; got != 0 {
+		t.Errorf("DeadlineProximityBuckets() mutated by caller, got %v", got)
+	}
+	labels[0] = "tampered"
+	if got := DeadlineProximityBucketLabels()[0]; got != "0" {
+		t.Errorf("DeadlineProximityBucketLabels() mutated by caller, got %q", got)
+	}
+}
+
+func TestSetDeadlineProximity(t *testing.T) {
+	DeadlineProximity.Reset()
+	// Cumulative counts for buckets 0, 1s, 5s, 15s, 30s, 1m, 2m, 5m, 10m, 30m,
+	// 1h, 2h, 6h, 24h.
+	cumulative := []int64{1, 2, 2, 2, 3, 3, 3, 4, 5, 6, 7, 7, 8, 9}
+	SetDeadlineProximity("q1", "queue-1", "pool-a", cumulative)
+
+	h := collectHistogram(t, DeadlineProximity, map[string]string{
+		"queue_id": "q1", "queue_name": "queue-1", "pool_name": "pool-a",
+	})
+	if got := h.GetSampleCount(); got != 9 {
+		t.Errorf("sample count = %d, want 9", got)
+	}
+	// Estimated from bucket midpoints: (0+1000)/2, (15000+30000)/2,
+	// (120000+300000)/2, (300000+600000)/2, (600000+1800000)/2,
+	// (1800000+3600000)/2, (7200000+21600000)/2, (21600000+86400000)/2.
+	if got := h.GetSampleSum(); got != 72983000 {
+		t.Errorf("sample sum = %v, want 72983000", got)
+	}
+	// Every le bucket is present, zero-count ones included.
+	buckets := h.GetBucket()
+	if len(buckets) != 14 {
+		t.Fatalf("bucket count = %d, want 14", len(buckets))
+	}
+	wantCumulative := []uint64{1, 2, 2, 2, 3, 3, 3, 4, 5, 6, 7, 7, 8, 9}
+	wantBounds := []float64{0, 1000, 5000, 15000, 30000, 60000, 120000, 300000, 600000,
+		1800000, 3600000, 7200000, 21600000, 86400000}
+	for i, b := range buckets {
+		if b.GetUpperBound() != wantBounds[i] {
+			t.Errorf("bucket[%d] upper bound = %v, want %v", i, b.GetUpperBound(), wantBounds[i])
+		}
+		if b.GetCumulativeCount() != wantCumulative[i] {
+			t.Errorf("bucket[%d] cumulative count = %d, want %d", i, b.GetCumulativeCount(), wantCumulative[i])
+		}
+	}
+
+	// Snapshot semantics: the next poll replaces, not accumulates.
+	SetDeadlineProximity("q1", "queue-1", "pool-a", make([]int64, 14))
+	h = collectHistogram(t, DeadlineProximity, map[string]string{
+		"queue_id": "q1", "queue_name": "queue-1", "pool_name": "pool-a",
+	})
+	if got := h.GetSampleCount(); got != 0 {
+		t.Errorf("sample count after empty poll = %d, want 0", got)
+	}
+
+	// A length mismatch is an internal invariant violation and is ignored.
+	SetDeadlineProximity("q1", "queue-1", "pool-a", []int64{1})
+	if got := collectHistogram(t, DeadlineProximity, map[string]string{
+		"queue_id": "q1", "queue_name": "queue-1", "pool_name": "pool-a",
+	}).GetSampleCount(); got != 0 {
+		t.Errorf("sample count after bad-length Set = %d, want unchanged 0", got)
+	}
+}
+
+// collectHistogram gathers a collector and returns the histogram whose labels
+// match wantLabels.
+func collectHistogram(t *testing.T, c prometheus.Collector, wantLabels map[string]string) *dto.Histogram {
+	t.Helper()
+	ch := make(chan prometheus.Metric, 8)
+	c.Collect(ch)
+	close(ch)
+	for m := range ch {
+		var dto dto.Metric
+		if err := m.Write(&dto); err != nil {
+			t.Fatalf("write metric: %v", err)
+		}
+		matches := true
+		for _, lp := range dto.GetLabel() {
+			if want, ok := wantLabels[lp.GetName()]; !ok || lp.GetValue() != want {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return dto.GetHistogram()
+		}
+	}
+	t.Fatalf("no histogram matched labels %v", wantLabels)
+	return nil
 }
 
 func containsCollector(collectors []prometheus.Collector, target prometheus.Collector) bool {

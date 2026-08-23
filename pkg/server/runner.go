@@ -443,6 +443,17 @@ func pollBacklog(ctx context.Context, reporter pipeline.BacklogReporter, interva
 		}
 		for _, s := range stats {
 			metrics.SetBrokerBacklog(s.QueueID, s.QueueName, s.PoolName, float64(s.Depth))
+			// Nil counts mean the broker cannot report per-item deadlines
+			// (e.g. Cloud Pub/Sub); emit nothing for it. When present they are
+			// exact cumulative bucket counts, zeroed on a failed read so the
+			// deadline-proximity snapshot is cleared, not stale.
+			if s.ExpiringCounts != nil {
+				counts := make([]int64, 0, len(s.ExpiringCounts))
+				for _, ec := range s.ExpiringCounts {
+					counts = append(counts, ec.Count)
+				}
+				metrics.SetDeadlineProximity(s.QueueID, s.QueueName, s.PoolName, counts)
+			}
 		}
 	}
 
