@@ -31,12 +31,26 @@ type RequestMergePolicy interface {
 	MergeRequestChannels(channels []RequestChannel, pools map[string]WorkerPoolConfig) PoolDispatch
 }
 
+// ExpiringCount pairs a deadline-proximity bucket with the exact number of
+// queued items whose deadline falls within it. Window is the histogram le
+// bucket label (e.g. "0" for expired items, "60000" for up to 60s away) and
+// counts are cumulative across buckets, matching le semantics.
+type ExpiringCount struct {
+	Window string
+	Count  int64
+}
+
 // QueueBacklogStat reports the broker-side backlog for a single queue.
 type QueueBacklogStat struct {
 	QueueID   string
 	QueueName string
 	PoolName  string
 	Depth     int64
+	// ExpiringCounts holds exact cumulative per-bucket counts of queued items
+	// nearing their deadline, ordered as the metric's bucket boundaries (most
+	// urgent first). Nil when the broker cannot expose per-item deadlines
+	// (e.g. Pub/Sub) or the read failed.
+	ExpiringCounts []ExpiringCount
 }
 
 // BacklogReporter is an optional capability for flows backed by a broker that

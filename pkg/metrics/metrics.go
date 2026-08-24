@@ -2,7 +2,9 @@
 package metrics
 
 import (
+	"strconv"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	controllerruntime "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -141,6 +143,166 @@ const (
 	ReasonError          = "error"
 )
 
+// DeadlineProximity is a per-poll snapshot histogram of the time remaining
+// until deadline (ms) for items still queued in the broker. Bucket counts are
+// exact per-poll broker queries (ZCOUNT), not samples; le="0" holds items
+// already past their deadline but not yet dequeued. Unlike a classic histogram
+// it is not monotonic: every poll replaces the snapshot, so rate() is
+// meaningless — use histogram_quantile per scrape. The _sum is estimated from
+// bucket midpoints (expired items count as 0; the overflow bucket at the last
+// boundary). Only populated for brokers that expose per-item deadlines (Redis
+// sorted sets).
+var DeadlineProximity = newDeadlineProximityCollector()
+
+// deadlineProximityBuckets are the le bucket boundaries, most urgent first.
+// The 0 boundary separates expired items (deadline <= now) from the rest; the
+// remaining boundaries match the queue residence time buckets.
+var deadlineProximityBuckets = []time.Duration{
+	0,
+	time.Second,
+	5 * time.Second,
+	15 * time.Second,
+	30 * time.Second,
+	time.Minute,
+	2 * time.Minute,
+	5 * time.Minute,
+	10 * time.Minute,
+	30 * time.Minute,
+	time.Hour,
+	2 * time.Hour,
+	6 * time.Hour,
+	24 * time.Hour,
+}
+
+// DeadlineProximityBuckets returns the le bucket boundaries, most urgent
+// first, in the order cumulative counts are fed to SetDeadlineProximity.
+// Callers must not mutate the returned slice.
+func DeadlineProximityBuckets() []time.Duration {
+	return append([]time.Duration(nil), deadlineProximityBuckets...)
+}
+
+var deadlineProximityBucketLabels = buildDeadlineProximityBucketLabels()
+
+// DeadlineProximityBucketLabels returns the le bucket labels in the same order
+// as DeadlineProximityBuckets. Callers must not mutate the returned slice.
+func DeadlineProximityBucketLabels() []string {
+	return append([]string(nil), deadlineProximityBucketLabels...)
+}
+
+func buildDeadlineProximityBucketLabels() []string {
+	labels := make([]string, 0, len(deadlineProximityBuckets))
+	for _, b := range deadlineProximityBuckets {
+		labels = append(labels, strconv.FormatInt(int64(b.Milliseconds()), 10))
+	}
+	return labels
+}
+
+// deadlineProximitySeries is one label set's cumulative bucket counts, aligned
+// with deadlineProximityBuckets.
+type deadlineProximitySeries struct {
+	labelValues []string
+	cumulative  []int64
+}
+
+// deadlineProximityCollector emits async_deadline_proximity_millis as a custom
+// collector because the backlog poller feeds exact pre-computed bucket counts,
+// which a HistogramVec cannot accept (it only observes individual values).
+var _ prometheus.Collector = (*deadlineProximityCollector)(nil)
+
+type deadlineProximityCollector struct {
+	desc   *prometheus.Desc
+	mu     sync.Mutex
+	series map[string]*deadlineProximitySeries
+}
+
+func newDeadlineProximityCollector() *deadlineProximityCollector {
+	return &deadlineProximityCollector{
+		desc: prometheus.NewDesc(
+			prometheus.BuildFQName(SchedulerSubsystem, "", "async_deadline_proximity_millis"),
+			"Time remaining until deadline (ms) for items still queued in the broker, as a per-poll snapshot histogram of exact bucket counts (le=\"0\" holds items past their deadline but still queued). Counts are exact broker queries, not samples; the _sum is estimated from bucket midpoints. Only populated for brokers that expose per-item deadlines (Redis sorted sets). Not monotonic: each poll replaces the snapshot, so rate() is meaningless; use histogram_quantile per scrape.",
+			queueLabels, nil),
+		series: make(map[string]*deadlineProximitySeries),
+	}
+}
+
+func (c *deadlineProximityCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.desc
+}
+
+func (c *deadlineProximityCollector) Collect(ch chan<- prometheus.Metric) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, s := range c.series {
+		ch <- prometheus.MustNewConstHistogram(c.desc, s.total(), s.estimatedSum(), s.bucketCounts(), s.labelValues...)
+	}
+}
+
+// bucketCounts returns every le bucket with its cumulative count, including
+// zero-count buckets, so empty queues still expose the full bucket shape.
+func (s *deadlineProximitySeries) bucketCounts() map[float64]uint64 {
+	buckets := make(map[float64]uint64, len(s.cumulative))
+	for i, b := range deadlineProximityBuckets {
+		// #nosec G115 -- Set clamps cumulative counts to >= 0, so the conversion cannot wrap.
+		buckets[float64(b.Milliseconds())] = uint64(s.cumulative[i])
+	}
+	return buckets
+}
+
+// estimatedSum approximates the histogram _sum from bucket midpoints: the
+// expired bucket (le=0) counts as 0, interior buckets at the midpoint of their
+// range. Prometheus histograms only accept Observe(), so a pre-aggregated
+// histogram has no real sum; the estimate only affects averages, never
+// histogram_quantile (which reads bucket counts).
+func (s *deadlineProximitySeries) estimatedSum() float64 {
+	var sum float64
+	var prevBound, prevCount float64
+	for i, b := range deadlineProximityBuckets {
+		bound := float64(b.Milliseconds())
+		count := float64(s.cumulative[i]) - prevCount
+		if count > 0 {
+			sum += count * (prevBound + bound) / 2
+		}
+		prevBound, prevCount = bound, float64(s.cumulative[i])
+	}
+	return sum
+}
+
+func (s *deadlineProximitySeries) total() uint64 {
+	if len(s.cumulative) == 0 {
+		return 0
+	}
+	// #nosec G115 -- Set clamps cumulative counts to >= 0, so the conversion cannot wrap.
+	return uint64(s.cumulative[len(s.cumulative)-1])
+}
+
+// Set replaces the snapshot for a queue with exact cumulative bucket counts,
+// aligned with DeadlineProximityBuckets. A length mismatch is an internal
+// invariant violation and is ignored.
+func (c *deadlineProximityCollector) Set(queueID, queueName, poolName string, cumulative []int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(cumulative) != len(deadlineProximityBuckets) {
+		return
+	}
+	cs := make([]int64, len(cumulative))
+	for i, v := range cumulative {
+		if v > 0 {
+			cs[i] = v
+		}
+	}
+	c.series[queueID+"\x00"+queueName+"\x00"+poolName] = &deadlineProximitySeries{
+		labelValues: []string{queueID, queueName, poolName},
+		cumulative:  cs,
+	}
+}
+
+// Reset clears every snapshot series.
+func (c *deadlineProximityCollector) Reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.series = make(map[string]*deadlineProximitySeries)
+}
+
 func RecordRetry(queueID, queueName, poolName string) {
 	Retries.WithLabelValues(queueID, queueName, poolName).Inc()
 }
@@ -184,6 +346,13 @@ func RecordInferenceLatency(millis float64, queueID, queueName, poolName string)
 // from broker ingestion until a worker pulled it.
 func RecordQueueResidenceTime(millis float64, queueID, queueName, poolName string) {
 	QueueResidenceTime.WithLabelValues(queueID, queueName, poolName).Observe(millis)
+}
+
+// SetDeadlineProximity replaces a queue's deadline-proximity snapshot
+// histogram with the exact cumulative bucket counts read from the broker
+// (order aligned with DeadlineProximityBuckets).
+func SetDeadlineProximity(queueID, queueName, poolName string, cumulative []int64) {
+	DeadlineProximity.Set(queueID, queueName, poolName, cumulative)
 }
 
 // IncQueueDepth increments the count of in-process buffered requests.
@@ -266,6 +435,7 @@ func GetAsyncProcessorCollectors(supportsMessageLatency bool) []prometheus.Colle
 	collectors := []prometheus.Collector{
 		Retries, AsyncReqs, ExceededDeadlineReqs, FailedReqs, SuccessfulReqs, SheddedRequests, Tokens,
 		QueueDepth, InflightRequests, BrokerBacklog, InferenceLatencyTime, QueueResidenceTime,
+		DeadlineProximity,
 		DispatchBudget, PoolWorkerLimit, GateDecisions,
 		GateMetricValue, GateMetricThreshold, GateMetricSourceAvailable,
 	}

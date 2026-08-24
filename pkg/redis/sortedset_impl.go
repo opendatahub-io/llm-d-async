@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strconv"
 	"sync"
 	"time"
 
@@ -263,31 +264,96 @@ func (r *RedisSortedSetFlow) RequestChannels() []pipeline.RequestChannel {
 	return channels
 }
 
-// QueueBacklog reports the number of pending members in each queue's sorted set.
+// zeroExpiringCounts builds a non-nil ExpiringCounts slice with every bucket
+// present and count 0. Used on failed reads so pollBacklog clears the
+// deadline-proximity snapshot instead of leaving its last value stale; nil
+// (Pub/Sub) still means the broker cannot report deadlines at all.
+func zeroExpiringCounts(labels []string) []pipeline.ExpiringCount {
+	counts := make([]pipeline.ExpiringCount, 0, len(labels))
+	for _, l := range labels {
+		counts = append(counts, pipeline.ExpiringCount{Window: l})
+	}
+	return counts
+}
+
+// QueueBacklog reports the number of pending members in each queue's sorted
+// set and exact cumulative per-bucket counts of members nearing their
+// deadline. Bucket counts come from ZCOUNT, which compares only scores and
+// never reads member payloads, so the read cost is independent of request
+// size.
 func (r *RedisSortedSetFlow) QueueBacklog(ctx context.Context) ([]pipeline.QueueBacklogStat, error) {
 	stats := make([]pipeline.QueueBacklogStat, 0, len(r.requestChannels))
 	var firstErr error
+	buckets := metrics.DeadlineProximityBuckets()
+	bucketLabels := metrics.DeadlineProximityBucketLabels()
 	for _, cd := range r.requestChannels {
-		depth, err := r.rdb.ZCard(ctx, cd.queueName).Result()
-		if err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("ZCard on queue %q: %w", cd.queueName, err)
-			}
-			// Report 0 rather than skipping so the gauge does not retain a
-			// stale value for this queue after a failed poll.
-			stats = append(stats, pipeline.QueueBacklogStat{
-				QueueID:   cd.queueID,
-				QueueName: cd.queueName,
-				PoolName:  cd.channel.WorkerPoolID,
-			})
-			continue
-		}
-		stats = append(stats, pipeline.QueueBacklogStat{
+		stat := pipeline.QueueBacklogStat{
 			QueueID:   cd.queueID,
 			QueueName: cd.queueName,
 			PoolName:  cd.channel.WorkerPoolID,
-			Depth:     depth,
+		}
+		now := time.Now().Unix()
+		var cardCmd *redis.IntCmd
+		countCmds := make([]*redis.IntCmd, 0, len(buckets))
+		// One MULTI/EXEC round trip per queue: the sorted set is mutated by
+		// ZPopMin between polls, so a single snapshot keeps Depth and the
+		// bucket counts mutually consistent.
+		_, err := r.rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			cardCmd = pipe.ZCard(ctx, cd.queueName)
+			for _, b := range buckets {
+				countCmds = append(countCmds, pipe.ZCount(ctx, cd.queueName, "-inf",
+					strconv.FormatInt(now+int64(b.Seconds()), 10)))
+			}
+			return nil
 		})
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("pipelined backlog read on queue %q: %w", cd.queueName, err)
+			}
+			// Report 0 rather than skipping so the gauges do not retain a
+			// stale value for this queue after a failed poll. The zeroed
+			// expiring counts clear the deadline-proximity snapshot.
+			stat.ExpiringCounts = zeroExpiringCounts(bucketLabels)
+			stats = append(stats, stat)
+			continue
+		}
+		if err := cardCmd.Err(); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("ZCard on queue %q: %w", cd.queueName, err)
+			}
+			// Report 0 rather than skipping so the gauges do not retain a
+			// stale value for this queue after a failed poll.
+			stat.ExpiringCounts = zeroExpiringCounts(bucketLabels)
+			stats = append(stats, stat)
+			continue
+		}
+		stat.Depth = cardCmd.Val()
+		var secondaryErr error
+		for _, cc := range countCmds {
+			if cc.Err() != nil {
+				secondaryErr = cc.Err()
+			}
+		}
+		if secondaryErr != nil {
+			// The depth read succeeded; keep it so async_broker_backlog does
+			// not look drained. The deadline view clears instead: the counts
+			// are zeroed so the deadline-proximity snapshot is cleared, not
+			// stale.
+			if firstErr == nil {
+				firstErr = fmt.Errorf("deadline reads on queue %q: %w", cd.queueName, secondaryErr)
+			}
+			stat.ExpiringCounts = zeroExpiringCounts(bucketLabels)
+			stats = append(stats, stat)
+			continue
+		}
+		stat.ExpiringCounts = make([]pipeline.ExpiringCount, 0, len(countCmds))
+		for i, l := range bucketLabels {
+			stat.ExpiringCounts = append(stat.ExpiringCounts, pipeline.ExpiringCount{
+				Window: l,
+				Count:  countCmds[i].Val(),
+			})
+		}
+		stats = append(stats, stat)
 	}
 	return stats, firstErr
 }

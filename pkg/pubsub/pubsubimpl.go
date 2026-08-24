@@ -339,6 +339,10 @@ func (r *PubSubMQFlow) Shutdown() {
 // sourced from the Cloud Monitoring metric
 // pubsub.googleapis.com/subscription/num_undelivered_messages. The value is
 // approximate and lags real time by the metric's sampling interval.
+//
+// ExpiringCounts is intentionally never set: Cloud Monitoring exposes only
+// the aggregate undelivered-message count, not per-item deadlines, so the view
+// stays nil and the poller emits nothing for it.
 func (r *PubSubMQFlow) QueueBacklog(ctx context.Context) ([]pipeline.QueueBacklogStat, error) {
 	if r.metricClient == nil {
 		// Backlog reporting was disabled at startup (already logged when the

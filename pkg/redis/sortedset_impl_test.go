@@ -1869,6 +1869,124 @@ func TestQueueBacklog(t *testing.T) {
 	}
 }
 
+func TestQueueBacklogDeadlineViews(t *testing.T) {
+	_, rdb, ctx, cancel := setupTest(t)
+	defer rdb.Close() // nolint:errcheck
+	defer cancel()
+
+	flow := &RedisSortedSetFlow{
+		rdb: rdb,
+		requestChannels: []requestChannelData{
+			{queueName: "queue-a", queueID: "a"},
+		},
+	}
+
+	now := time.Now().Unix()
+	// Relative offsets (seconds): two expired (one exactly at now, which must
+	// count in le="0" and therefore in every higher cumulative bucket too),
+	// then one item per bucket span. Offsets keep at least 5s of margin from
+	// every bucket boundary (0, 1, 5, 15, 30, 60, 120, 300, 600, 1800, 3600,
+	// 7200, ...) because QueueBacklog reads ZCOUNT against its own clock,
+	// which may be up to a second ahead of the test's.
+	offsets := []int64{-10, 0, 10, 40, 100, 400, 1000, 4000}
+	for i, off := range offsets {
+		rdb.ZAdd(ctx, "queue-a", redis.Z{Score: float64(now + off), Member: fmt.Sprintf("m%d", i)})
+	}
+
+	stats, err := flow.QueueBacklog(ctx)
+	if err != nil {
+		t.Fatalf("QueueBacklog returned error: %v", err)
+	}
+	if len(stats) != 1 {
+		t.Fatalf("len(stats) = %d, want 1", len(stats))
+	}
+	s := stats[0]
+	if s.Depth != 8 {
+		t.Errorf("Depth = %d, want 8", s.Depth)
+	}
+
+	// Bucket counts are cumulative le semantics: bucket b counts every item
+	// with deadline <= now+b. The offset-0 item is expired (le="0") and so
+	// appears in every bucket.
+	wantLabels := metrics.DeadlineProximityBucketLabels()
+	if len(s.ExpiringCounts) != len(wantLabels) {
+		t.Fatalf("len(ExpiringCounts) = %d, want %d", len(s.ExpiringCounts), len(wantLabels))
+	}
+	wantCounts := map[string]int64{
+		"0":        2, // -10, 0
+		"1000":     2,
+		"5000":     2,
+		"15000":    3, // +10
+		"30000":    3,
+		"60000":    4, // +40
+		"120000":   5, // +100
+		"300000":   5,
+		"600000":   6, // +400
+		"1800000":  7, // +1000
+		"3600000":  7,
+		"7200000":  8, // +4000
+		"21600000": 8,
+		"86400000": 8,
+	}
+	gotCounts := make(map[string]int64, len(s.ExpiringCounts))
+	for i, ec := range s.ExpiringCounts {
+		if ec.Window != wantLabels[i] {
+			t.Errorf("ExpiringCounts[%d].Window = %q, want %q (bucket order)", i, ec.Window, wantLabels[i])
+		}
+		gotCounts[ec.Window] = ec.Count
+	}
+	for window, want := range wantCounts {
+		if gotCounts[window] != want {
+			t.Errorf("ExpiringCounts[%q] = %d, want %d", window, gotCounts[window], want)
+		}
+	}
+}
+
+// Bucket counts are exact regardless of queue size: ZCOUNT compares only
+// scores, so a large queue costs the same to read as a small one.
+func TestQueueBacklogDeadlineCountsAtScale(t *testing.T) {
+	_, rdb, ctx, cancel := setupTest(t)
+	defer rdb.Close() // nolint:errcheck
+	defer cancel()
+
+	flow := &RedisSortedSetFlow{
+		rdb: rdb,
+		requestChannels: []requestChannelData{
+			{queueName: "queue-big", queueID: "big"},
+		},
+	}
+
+	now := time.Now().Unix()
+	// Seed from now+100s so no item's score can collide with the poller's own
+	// `now` (an item whose deadline equals the current second is expired).
+	for i := 0; i < 1002; i++ {
+		rdb.ZAdd(ctx, "queue-big", redis.Z{Score: float64(now + 100 + int64(i)), Member: fmt.Sprintf("m%d", i)})
+	}
+
+	stats, err := flow.QueueBacklog(ctx)
+	if err != nil {
+		t.Fatalf("QueueBacklog returned error: %v", err)
+	}
+	s := stats[0]
+	if s.Depth != 1002 {
+		t.Errorf("Depth = %d, want 1002", s.Depth)
+	}
+	// All items are within 24h of now, so the final cumulative bucket holds
+	// every one of them; the expired bucket is empty.
+	for _, ec := range s.ExpiringCounts {
+		switch ec.Window {
+		case "86400000":
+			if ec.Count != 1002 {
+				t.Errorf("24h bucket count = %d, want 1002 (counts must not be capped)", ec.Count)
+			}
+		case "0":
+			if ec.Count != 0 {
+				t.Errorf("expired bucket count = %d, want 0", ec.Count)
+			}
+		}
+	}
+}
+
 // TestQueueBacklogReportsZeroOnError verifies that a per-queue failure reports a
 // 0 sentinel for that queue (rather than skipping it) so the gauge does not
 // retain a stale value, while healthy queues still report their real depth.
@@ -1906,6 +2024,25 @@ func TestQueueBacklogReportsZeroOnError(t *testing.T) {
 	}
 	if got["queue-ok"] != 1 {
 		t.Errorf("queue-ok backlog = %d, want 1", got["queue-ok"])
+	}
+
+	// A failed read must leave the expiring counts zeroed with every bucket
+	// present, so the deadline-proximity snapshot is cleared rather than left
+	// stale.
+	for _, s := range stats {
+		if s.QueueName == "queue-bad" {
+			if s.ExpiringCounts == nil {
+				t.Fatal("queue-bad expiring counts must be non-nil on ZCard failure")
+			}
+			for _, ec := range s.ExpiringCounts {
+				if ec.Count != 0 {
+					t.Errorf("queue-bad bucket %q count = %d, want 0", ec.Window, ec.Count)
+				}
+			}
+			if got := len(s.ExpiringCounts); got != len(metrics.DeadlineProximityBucketLabels()) {
+				t.Errorf("queue-bad expiring count buckets = %d, want %d", got, len(metrics.DeadlineProximityBucketLabels()))
+			}
+		}
 	}
 }
 
