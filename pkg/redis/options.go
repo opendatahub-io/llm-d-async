@@ -93,13 +93,23 @@ type SortedSetConfig struct {
 
 // LoadSortedSetConfig parses, applies env overrides/defaults, and validates a SortedSetConfig.
 func LoadSortedSetConfig(data []byte) (*SortedSetConfig, error) {
+	return loadSortedSetConfig(data, false)
+}
+
+// LoadSortedSetConfigAllowEmptyQueues is used by queue hot reload, where an
+// operator may temporarily drain every queue. Startup still requires a queue.
+func LoadSortedSetConfigAllowEmptyQueues(data []byte) (*SortedSetConfig, error) {
+	return loadSortedSetConfig(data, true)
+}
+
+func loadSortedSetConfig(data []byte, allowEmptyQueues bool) (*SortedSetConfig, error) {
 	var cfg SortedSetConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse redis-sortedset transport config: %w", err)
 	}
 	cfg.ApplyEnvOverrides()
 	cfg.ApplyDefaults()
-	if err := cfg.Validate(); err != nil {
+	if err := cfg.validate(allowEmptyQueues); err != nil {
 		return nil, fmt.Errorf("invalid redis-sortedset transport config: %w", err)
 	}
 	return &cfg, nil
@@ -141,10 +151,14 @@ func (c *SortedSetConfig) ApplyDefaults() {
 }
 
 func (c *SortedSetConfig) Validate() error {
+	return c.validate(false)
+}
+
+func (c *SortedSetConfig) validate(allowEmptyQueues bool) error {
 	if c.URL == "" {
 		return fmt.Errorf("url is required (set url in the transport config or REDIS_URL)")
 	}
-	if len(c.Queues) == 0 {
+	if !allowEmptyQueues && len(c.Queues) == 0 {
 		return fmt.Errorf("at least one queue must be configured")
 	}
 	seenID := make(map[string]bool, len(c.Queues))
