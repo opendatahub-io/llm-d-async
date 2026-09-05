@@ -102,7 +102,11 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 		return err
 	}
 
-	flow, err := loadFlow(opts, gateFactory, poolsMap)
+	flow, sortedSetConfig, err := loadFlow(opts, gateFactory, poolsMap)
+	if err != nil {
+		return err
+	}
+	reconfigurer, dynamicPolicy, watchEnabled, err := validateQueuesConfigWatch(opts, flow, policy)
 	if err != nil {
 		return err
 	}
@@ -175,6 +179,13 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 	flow.Start(ctx)
 	healthServer.SetReady()
 
+	var queuesReloadDone <-chan struct{}
+	if watchEnabled {
+		queuesReloadDone = startQueuesConfigReload(ctx, opts.Transport.ConfigFile,
+			opts.Transport.ConfigWatchInterval, sortedSetConfig,
+			reconfigurer, dynamicPolicy, poolsMap, setupLog)
+	}
+
 	if reporter, ok := flow.(pipeline.BacklogReporter); ok && opts.Transport.BacklogPollInterval > 0 {
 		go pollBacklog(ctx, reporter, opts.Transport.BacklogPollInterval)
 	} else if !ok {
@@ -183,9 +194,11 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 
 	<-ctx.Done()
 	healthServer.SetNotReady()
-
 	setupLog.Info("Signal received, stopping message consumption")
 	flow.StopConsuming()
+	if queuesReloadDone != nil {
+		<-queuesReloadDone
+	}
 
 	setupLog.Info("Draining in-flight requests", "timeout", opts.Worker.DrainTimeout)
 	done := make(chan struct{})
@@ -274,7 +287,7 @@ func loadRequestMergePolicy(configPath string, ctx context.Context) (pipeline.Re
 	return policy, nil
 }
 
-func loadFlow(opts *Options, gateFactory *flowcontrol.GateFactory, poolsMap map[string]pipeline.WorkerPoolConfig) (pipeline.Flow, error) {
+func loadFlow(opts *Options, gateFactory *flowcontrol.GateFactory, poolsMap map[string]pipeline.WorkerPoolConfig) (pipeline.Flow, *redis.SortedSetConfig, error) {
 	workerPools := make([]pipeline.WorkerPoolConfig, 0, len(poolsMap))
 	for _, p := range poolsMap {
 		workerPools = append(workerPools, p)
@@ -282,35 +295,39 @@ func loadFlow(opts *Options, gateFactory *flowcontrol.GateFactory, poolsMap map[
 
 	transportType, configBytes, err := opts.resolveTransport()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	switch transportType {
 	case "redis-pubsub":
 		cfg, err := redis.LoadPubSubConfig(configBytes)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return redis.NewRedisMQFlow(*cfg, workerPools)
+		flow, err := redis.NewRedisMQFlow(*cfg, workerPools)
+		return flow, nil, err
 	case "redis-sortedset":
 		cfg, err := redis.LoadSortedSetConfig(configBytes)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return redis.NewRedisSortedSetFlow(*cfg, workerPools, gateFactory)
+		flow, err := redis.NewRedisSortedSetFlow(*cfg, workerPools, gateFactory)
+		return flow, cfg, err
 	case "gcp-pubsub":
 		cfg, err := pubsub.LoadConfig(configBytes)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		// The legacy plain gcp-pubsub alias never gated (see legacyUngatedPubSub);
 		// pass a nil factory so a gate_type in a legacy topics file stays inert.
 		if opts.legacyUngatedPubSub() {
-			return pubsub.NewGCPPubSubMQFlow(*cfg, workerPools, nil)
+			flow, err := pubsub.NewGCPPubSubMQFlow(*cfg, workerPools, nil)
+			return flow, nil, err
 		}
-		return pubsub.NewGCPPubSubMQFlow(*cfg, workerPools, gateFactory)
+		flow, err := pubsub.NewGCPPubSubMQFlow(*cfg, workerPools, gateFactory)
+		return flow, nil, err
 	default:
-		return nil, fmt.Errorf("unknown transport: %s", transportType)
+		return nil, nil, fmt.Errorf("unknown transport: %s", transportType)
 	}
 }
 
@@ -435,13 +452,19 @@ func pollBacklog(ctx context.Context, reporter pipeline.BacklogReporter, interva
 	logger := ctrl.Log.WithName("backlog-poller")
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	type queueLabels struct {
+		id, name, pool string
+	}
+	previous := make(map[queueLabels]struct{})
 
 	poll := func() {
 		stats, err := reporter.QueueBacklog(ctx)
 		if err != nil {
 			logger.V(logging.DEFAULT).Error(err, "Failed to poll broker backlog")
 		}
+		current := make(map[queueLabels]struct{}, len(stats))
 		for _, s := range stats {
+			current[queueLabels{id: s.QueueID, name: s.QueueName, pool: s.PoolName}] = struct{}{}
 			metrics.SetBrokerBacklog(s.QueueID, s.QueueName, s.PoolName, float64(s.Depth))
 			// Nil counts mean the broker cannot report per-item deadlines
 			// (e.g. Cloud Pub/Sub); emit nothing for it. When present they are
@@ -454,6 +477,14 @@ func pollBacklog(ctx context.Context, reporter pipeline.BacklogReporter, interva
 				}
 				metrics.SetDeadlineProximity(s.QueueID, s.QueueName, s.PoolName, counts)
 			}
+		}
+		if err == nil {
+			for labels := range previous {
+				if _, exists := current[labels]; !exists {
+					metrics.RemoveQueueSnapshots(labels.id, labels.name, labels.pool)
+				}
+			}
+			previous = current
 		}
 	}
 
