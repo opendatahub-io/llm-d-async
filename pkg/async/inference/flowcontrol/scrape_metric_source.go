@@ -38,14 +38,16 @@ var _ MetricSource = (*ScrapeMetricSource)(nil)
 //   - Dynamic: when podsURL/podsMetric are set, ready pods are scraped from a second
 //     endpoint (e.g., EPP) and max_count = ready_pods * maxCountPerPod.
 //
-// When maxCountPerPod == 0, the metric value is assumed to already be saturation in [0, 1].
-// Output value = 1 - saturation (available capacity / budget).
+// When maxCountPerPod == 0, the metric value is assumed to already be normalized in [0, 1].
+// By default the normalized value is saturation and output = 1 - saturation. When
+// directBudget is set, the normalized value is returned as the budget instead.
 type ScrapeMetricSource struct {
 	client         *http.Client
 	url            string
 	metricName     string
 	labels         map[string]string
 	maxCountPerPod float64
+	directBudget   bool
 	podsURL        string
 	podsMetric     string
 	podsLabels     map[string]string
@@ -57,6 +59,7 @@ type ScrapeConfig struct {
 	MetricName     string
 	Labels         map[string]string
 	MaxCountPerPod float64
+	DirectBudget   bool
 	PodsURL        string
 	PodsMetric     string
 	PodsLabels     map[string]string
@@ -71,6 +74,7 @@ func NewScrapeMetricSource(cfg ScrapeConfig) *ScrapeMetricSource {
 		metricName:     cfg.MetricName,
 		labels:         cfg.Labels,
 		maxCountPerPod: cfg.MaxCountPerPod,
+		directBudget:   cfg.DirectBudget,
 		podsURL:        cfg.PodsURL,
 		podsMetric:     cfg.PodsMetric,
 		podsLabels:     cfg.PodsLabels,
@@ -101,14 +105,18 @@ func (s *ScrapeMetricSource) Query(ctx context.Context) ([]Sample, error) {
 
 	result := make([]Sample, len(samples))
 	for i, sample := range samples {
-		var saturation float64
+		var normalized float64
 		if maxCount > 0 {
-			saturation = sample.Value / maxCount
+			normalized = sample.Value / maxCount
 		} else {
-			saturation = sample.Value
+			normalized = sample.Value
 		}
-		saturation = clampFloat(saturation, 0, 1)
-		result[i] = Sample{Labels: sample.Labels, Value: 1 - saturation}
+		normalized = clampFloat(normalized, 0, 1)
+		budget := 1 - normalized
+		if s.directBudget {
+			budget = normalized
+		}
+		result[i] = Sample{Labels: sample.Labels, Value: budget}
 	}
 
 	return result, nil
