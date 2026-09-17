@@ -1,11 +1,23 @@
 approvers:
+- aneeshkp
+- anishasthana
+- acardace
+- dagrayvid
 - evacchi
-- lioraron
-- yizhaodev
+- Gregory-Pereira
+- hexfusion
+- kylape
+- madhugoutham
+- pazqo
+- RishabhSaini
+- tessapham
+- wseaton
 - zdtsw
 
 reviewers:
 - evacchi
-- lioraron
-- yizhaodev
 - zdtsw
+- wseaton
+- aneeshkp
+- acardace
+- madhugoutham
