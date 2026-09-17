@@ -200,6 +200,7 @@ make deploy-ap-on-k8s
 | Flag | Default | Description |
 |------|---------|-------------|
 | `concurrency` | `64` | Number of concurrent workers (per pool if unspecified). The processor is I/O-bound (each worker holds one in-flight request for its full duration), so in-flight concurrency caps throughput — see [Queues, Topics, and Worker Pools](#queues-topics-and-worker-pools). |
+| `gate-wait-timeout` | `5m` | Maximum time a worker parks one request at a pool gate before recoverably re-enqueueing it. Independent of `request-timeout`; `0` waits until the request's own deadline. |
 | `transport` | `redis-pubsub` | The transport (message queue) implementation. One of `redis-pubsub` (**deprecated**: it still works but will be removed in a future release), `redis-sortedset`, `gcp-pubsub`. Gating is configured per queue/topic via `gate_type` in the transport config (this replaces the former `gcp-pubsub-gated` implementation). |
 | `transport-config` | — | Inline JSON transport configuration. See [Transport Configuration](#transport-configuration). Mutually exclusive with `transport-config-file`; exactly one of the two is required. |
 | `transport-config-file` | — | Path to a JSON file with the transport configuration. Mutually exclusive with `transport-config`. |
@@ -380,6 +381,7 @@ The available gate types, at a glance:
 |------|------|---------|
 | `constant` | budget | Always fully open (budget 1.0) — no throttling. |
 | `redis` | budget | Reads the dispatch budget from a Redis key managed by an external system. |
+| `redis-leased-rate` | admission | Enforces a leased, pool-wide dispatch-attempt rate from Redis. Missing, invalid, unreadable, or expired commands fail closed. |
 | `prometheus-saturation` | budget | Closes when a pool saturation metric reaches a threshold. |
 | `prometheus-budget` | budget | Computes a dispatch budget from a cascade of EPP/vLLM metrics. |
 | `prometheus-query` | budget | Evaluates a user-supplied PromQL expression as the budget. |
@@ -488,6 +490,61 @@ The available gate types, at a glance:
   - `address` (**required**): Redis server address for the dispatch gate (e.g., `localhost:6379`). Queues sharing the same address will share the same connection pool.
   - `budget_key` (optional): Redis key to read the dispatch budget from. Default is `dispatch-gate-budget`.
 
+- `redis-leased-rate`:
+  - `address` (**required**): Redis server address. Gate instances using the same address share a client connection pool.
+  - `control_key` (**required**): Redis hash containing the controller's leased rate command.
+  - `pool_id` (optional): Worker-pool ID the command must match. Defaults to the owning worker pool and is required when no owner is available.
+  - `state_key` (optional): Redis hash used by the shared token bucket. Defaults to `<control_key>:state`.
+  - `burst_seconds` (optional): Token-bucket burst window in seconds. Must be finite and positive; defaults to `1`.
+
+  Configure this as a **pool-level** gate inside `wait-on-refuse`, so a closed
+  lease parks workers in memory and rechecks with bounded jittered backoff instead
+  of repeatedly returning requests to the broker. If `gate-wait-timeout` elapses,
+  the held request is recoverably re-enqueued rather than completed with an error:
+
+  ```json
+  [
+    {
+      "id": "batch-pool",
+      "workers": 64,
+      "gate_type": "wait-on-refuse",
+      "gate_params": {
+        "gate": {
+          "gate_type": "redis-leased-rate",
+          "gate_params": {
+            "address": "batch-gateway-valkey:6379",
+            "control_key": "llm-d-async:drain-limit:batch-pool",
+            "burst_seconds": "0.25"
+          }
+        }
+      }
+    }
+  ]
+  ```
+
+  The controller writes the command as one Redis transaction. The field names
+  and values are the public `llm-d.ai/v1alpha1` wire contract:
+
+  ```text
+  MULTI
+  HSET llm-d-async:drain-limit:batch-pool \
+    api_version llm-d.ai/v1alpha1 \
+    pool_id batch-pool \
+    max_admission_rps 12.5 \
+    valid_until_unix_ms 1787928000000 \
+    decision_id planner-tick-000042
+  PEXPIREAT llm-d-async:drain-limit:batch-pool 1787928000000
+  EXEC
+  ```
+
+  `max_admission_rps` is a ceiling on attempts sent to the downstream inference
+  endpoint, including retries; it is not a promised completion rate. A value of
+  `0` is an explicit pause. The lease timestamp is authoritative even if a Redis
+  deployment retains the key longer than requested. The gate fails closed when
+  the key cannot be read or validated, so controllers should renew leases well
+  before expiry. All Async replicas using the same `control_key` and `state_key`
+  share one aggregate token bucket.
+
 - `prometheus-saturation`: Queries Prometheus for a pool saturation metric. The gate closes (returns `0.0`) when saturation ≥ threshold; when open it returns `(1 - saturation) - (1 - threshold)`, i.e. the margin below the threshold.
   - `pool` (**required**): The inference pool name to filter metrics by.
   - `namespace` (optional): Kubernetes namespace to scope metric queries. Required when multiple namespaces share the same pool name with a shared Prometheus instance.
@@ -589,12 +646,13 @@ The available gate types, at a glance:
     `async_gate_metric_threshold` so you can tell which pool a gauge is reporting on.
 
 - `endpoint-scrape`: Scrapes a raw Prometheus text-format `/metrics` endpoint directly.
-  Computes budget as `clamp(1 - saturation - baseline, 0, 1)`. Supports two modes: **direct saturation** (metric value is already in [0, 1], e.g., from the EPP) and **computed saturation** (raw count divided by `max_count_per_pod`, e.g., `vllm:num_requests_waiting`).
+  Normalizes the metric to `[0, 1]`, then interprets it as saturation by default or as a direct budget when `value_type` is `budget`. The final budget is `clamp(interpreted_budget - baseline, 0, 1)`. Saturation metrics use `1 - normalized_value`; budget metrics use `normalized_value`.
 
   - `url` (**required**): Full URL to scrape (e.g., `http://vllm-sim:8000/metrics`).
   - `metric` (**required**): Metric name to extract (e.g., `vllm:num_requests_waiting`).
   - `labels` (optional): JSON object of label filters (e.g., `{"model_name":"my-model"}`). Only samples matching all labels are used.
-  - `max_count_per_pod` (optional): Per-pod capacity. When > 0, saturation = `value / max_count`. When 0, the metric value is used directly as saturation (assumed to be in [0, 1]). Default is `0`.
+  - `value_type` (optional): How to interpret the normalized metric. `saturation` computes budget as `1 - normalized_value`; `budget` uses `normalized_value` directly. Default is `saturation`.
+  - `max_count_per_pod` (optional): Per-pod capacity. When > 0, the normalized value is `value / max_count`. When 0, the metric value is assumed to already be in [0, 1]. Default is `0`.
   - `baseline` (optional): Reserved headroom subtracted from budget. Default is `0.0`.
   - `fallback` (optional): Budget returned when scrape fails or metric is missing. Default is `0.0` (fail closed).
   - `pods_url` (optional): URL to scrape for dynamic pod count (e.g., `http://epp-svc:9090/metrics`). When set with `pods_metric`, `max_count = ready_pods * max_count_per_pod`.
@@ -603,7 +661,8 @@ The available gate types, at a glance:
 
   **No Prometheus server required.** This gate scrapes endpoints directly, making it suitable for
   deployments without a dedicated Prometheus instance. Use `max_count_per_pod` with `pods_url`/`pods_metric`
-  for dynamic scaling, or set `max_count_per_pod` to a static value for single-pod setups.
+  for dynamic scaling, or set `max_count_per_pod` to a static value for single-pod setups. For a
+  readiness metric where `1` means ready and `0` means unavailable, set `value_type` to `budget`.
 
 #### Admission gates
 
@@ -821,6 +880,7 @@ The Async Processor exposes Prometheus metrics under the `llm_d_async` subsystem
 | Metric | Type | Description |
 |--------|------|-------------|
 | `llm_d_async_async_dispatch_budget` | Gauge | Current dispatch budget [0.0–1.0] returned by the queue's gate; the fraction of system capacity available for new requests (0.0 = gate fully closed). Useful for diagnosing why throughput is throttled. |
+| `llm_d_async_async_gate_wait_requeues_total` | Counter | Recoverable requeues caused by the configured pool gate wait timeout. Public request deadlines and shutdown requeues are excluded. |
 | `llm_d_async_async_drain_limit_rps` | Gauge | Maximum dispatch-attempt RPS in the valid lease seen by the most recent gate evaluation. Zero with observed `lease_valid=1` is an explicit pause. Carries only `pool_name`. |
 | `llm_d_async_async_drain_limit_lease_valid` | Gauge | `1` when the most recent gate evaluation observed a valid, unexpired external drain-limit lease; otherwise `0`. This observation does not self-expire while no requests evaluate the gate; combine it with `valid_until_seconds > time()` for current validity. Carries only `pool_name`. |
 | `llm_d_async_async_drain_limit_valid_until_seconds` | Gauge | Unix timestamp when the most recently observed valid external drain-limit lease expires, or zero when that evaluation observed no valid lease. The drain-limit gauges initialize to zero/invalid when the gate starts. Carries only `pool_name`. |
@@ -982,7 +1042,7 @@ ap:
 
 ## Backend Compatibility
 
-The Async Processor uses the Redis wire protocol for its message queue implementations (`redis-sortedset`, `redis-pubsub`) and dispatch gates (`redis`, `redis-quota`). Redis-protocol-compatible backends such as [Valkey](https://valkey.io/) can be used with the existing Redis configuration surface.
+The Async Processor uses the Redis wire protocol for its message queue implementations (`redis-sortedset`, `redis-pubsub`) and dispatch gates (`redis`, `redis-leased-rate`, `redis-quota`). Redis-protocol-compatible backends such as [Valkey](https://valkey.io/) can be used with the existing Redis configuration surface.
 
 The `url` field in the transport configuration (see [Transport Configuration](#transport-configuration)), the `REDIS_URL` environment variable, and the deprecated `--redis.*` CLI flags all work unchanged with Valkey — point them at your Valkey endpoint the same way you would with Redis.
 

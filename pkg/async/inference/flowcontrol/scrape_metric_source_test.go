@@ -34,6 +34,9 @@ vllm:num_requests_waiting{model_name="other-model"} 7
 # TYPE inference_pool_saturation gauge
 inference_pool_saturation{name="pool-a"} 0.75
 inference_pool_saturation{name="pool-b"} 0.2
+# HELP model_ready Whether the model is ready.
+# TYPE model_ready gauge
+model_ready{model_name="sim-model"} 1
 `
 
 const testPodsMetricsBody = `# HELP ready_pods Number of ready pods.
@@ -78,6 +81,19 @@ func TestScrapeMetricSource(t *testing.T) {
 		require.Len(t, samples, 1)
 		// value=0.75, maxCount=0 → saturation=0.75 → budget=0.25
 		assert.InDelta(t, 0.25, samples[0].Value, 0.001)
+	})
+
+	t.Run("DirectBudget", func(t *testing.T) {
+		source := NewScrapeMetricSource(ScrapeConfig{
+			URL:          server.URL,
+			MetricName:   "model_ready",
+			Labels:       map[string]string{"model_name": "sim-model"},
+			DirectBudget: true,
+		})
+		samples, err := source.Query(context.Background())
+		require.NoError(t, err)
+		require.Len(t, samples, 1)
+		assert.InDelta(t, 1.0, samples[0].Value, 0.001)
 	})
 
 	t.Run("OverSaturationClamped", func(t *testing.T) {

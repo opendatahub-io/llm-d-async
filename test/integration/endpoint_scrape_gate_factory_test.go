@@ -93,6 +93,34 @@ pool_saturation{name="pool-a"} 0.6
 	assert.InDelta(t, 0.3, budget, 0.01)
 }
 
+func TestGateFactory_EndpointScrape_DirectBudget(t *testing.T) {
+	readyValue := &atomic.Value{}
+	readyValue.Store("1")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		fmt.Fprintf(w, "# TYPE model_ready gauge\nmodel_ready{model_name=\"sim-model\"} %s\n", readyValue.Load().(string))
+	}))
+	defer server.Close()
+
+	factory := flowcontrol.NewGateFactoryWithCacheTTL("", 0)
+
+	gate, err := factory.CreateGate(pipeline.GateConfig{GateType: "endpoint-scrape", GateParams: map[string]any{
+		"url":        server.URL,
+		"metric":     "model_ready",
+		"labels":     `{"model_name":"sim-model"}`,
+		"value_type": "budget",
+		"fallback":   0.0,
+	}})
+	require.NoError(t, err)
+
+	budget := gate.Budget(context.Background())
+	assert.InDelta(t, 1.0, budget, 0.01)
+
+	readyValue.Store("0")
+	budget = gate.Budget(context.Background())
+	assert.InDelta(t, 0.0, budget, 0.01)
+}
+
 func TestGateFactory_EndpointScrape_DynamicPods(t *testing.T) {
 	simServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
@@ -138,6 +166,13 @@ func TestGateFactory_EndpointScrape_MissingParams(t *testing.T) {
 		"url": "http://localhost:8000/metrics",
 	}})
 	assert.Error(t, err, "Should fail when metric is missing")
+
+	_, err = factory.CreateGate(pipeline.GateConfig{GateType: "endpoint-scrape", GateParams: map[string]any{
+		"url":        "http://localhost:8000/metrics",
+		"metric":     "some_metric",
+		"value_type": "unknown",
+	}})
+	assert.ErrorContains(t, err, "value_type must be either 'saturation' or 'budget'")
 }
 
 func TestGateFactory_EndpointScrape_FallbackOnError(t *testing.T) {
