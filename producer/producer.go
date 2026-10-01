@@ -57,9 +57,9 @@ type Producer interface {
 
 	// CancelRequests marks previously submitted requests as cancelled.
 	// Implementations guarantee best-effort cancellation before dispatch
-	// (during dequeue and worker pre-dispatch checks), but do not guarantee
-	// aborting requests that are already in flight to the inference backend
-	// or forcing already-dispatched requests to return a CANCELLED result.
+	// (during dequeue and worker pre-dispatch checks). Workers also poll the
+	// marker while inference is executing and abort the in-flight request,
+	// returning a CANCELLED result unless a terminal response arrived first.
 	// Cancellation is idempotent: unknown or already-completed request IDs are a no-op.
 	CancelRequests(ctx context.Context, requestIDs []string) error
 
