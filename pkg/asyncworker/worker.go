@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -332,7 +333,9 @@ func WorkerWithGateTimeout(consumeCtx, requestCtx context.Context, characteristi
 					logger.V(logutil.DEBUG).Info("Sending inference request", "url", msg.RequestURL)
 					metrics.RecordDispatchedReq(queueID, queueName, msg.WorkerPoolID)
 					inferenceStart := time.Now()
-					resp, err := client.SendRequest(reqCtx, msg.RequestURL, sendHeaders, sendPayload)
+					sendCtx, stopCancellationWatch := watchInflightCancellation(reqCtx, logger, msg)
+					resp, err := client.SendRequest(sendCtx, msg.RequestURL, sendHeaders, sendPayload)
+					cancelledInFlight := stopCancellationWatch()
 					metrics.RecordInferenceLatency(float64(time.Since(inferenceStart).Milliseconds()), queueID, queueName, msg.WorkerPoolID)
 
 					if err == nil {
@@ -362,6 +365,17 @@ func WorkerWithGateTimeout(consumeCtx, requestCtx context.Context, characteristi
 						retryChannel <- pipeline.RetryMessage{
 							EmbelishedRequestMessage: msg,
 							BackoffDurationSeconds:   0,
+						}
+						return
+					}
+
+					// The request was cancelled by its producer while inference was
+					// executing. A terminal response that arrived first was already
+					// returned above; otherwise surface CANCELLED and do not retry.
+					if cancelledInFlight {
+						select {
+						case resultChannel <- asyncapi.NewCancelledResult(msg.PublicRequest, msg.InternalRouting):
+						case <-requestCtx.Done():
 						}
 						return
 					}
@@ -625,6 +639,56 @@ func emitCancelledResultIfNeeded(
 	case <-ctx.Done():
 	}
 	return true
+}
+
+// watchInflightCancellation polls the request's cancellation marker while
+// inference is executing and cancels the returned context once the marker for
+// this request generation appears. The returned stop function ends polling and
+// reports whether the watcher cancelled the send; it must be called once the
+// send returns. Without a cancellation checker, ctx is returned unchanged.
+func watchInflightCancellation(ctx context.Context, logger logr.Logger, msg pipeline.EmbelishedRequestMessage) (context.Context, func() bool) {
+	checker := cancellationCheckerFromContext(ctx)
+	if checker == nil || msg.PublicRequest == nil {
+		return ctx, func() bool { return false }
+	}
+	sendCtx, cancel := context.WithCancel(ctx)
+	var cancelled atomic.Bool
+	go func() {
+		ticker := time.NewTicker(cancellationCheckPollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-sendCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			isCancelled, err := checker.IsCancelled(sendCtx, msg.PublicRequest.ReqID(), msg.RequestToken)
+			if sendCtx.Err() != nil {
+				// The send already finished or was aborted while the lookup
+				// ran, so its answer no longer matters.
+				return
+			}
+			if err != nil {
+				// Fail open: a lookup error must not abort a request that may
+				// still complete. The next tick checks again.
+				logger.V(logutil.DEBUG).Info("Failed to check in-flight request cancellation", "id", msg.PublicRequest.ReqID(), "err", err)
+				continue
+			}
+			if isCancelled {
+				cancelled.Store(true)
+				cancel()
+				return
+			}
+		}
+	}()
+	// Stop does not wait for a lookup still in flight: the Redis client does
+	// not abort a command on context cancellation by default, so waiting would
+	// let a slow Redis delay the result of a send that already finished. The
+	// flag is set before the watcher cancels the send, so it is reliable here.
+	return sendCtx, func() bool {
+		cancel()
+		return cancelled.Load()
+	}
 }
 
 // https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/

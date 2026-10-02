@@ -2965,6 +2965,226 @@ func TestWorker_RechecksCancellationImmediatelyBeforeSend(t *testing.T) {
 	}
 }
 
+// blockingInferenceHandler returns an HTTP client whose requests signal started
+// and then block until either their context is cancelled (recorded on aborted)
+// or release is closed, in which case they succeed.
+func blockingInferenceHandler(started chan<- string, aborted chan<- string, release <-chan struct{}) *http.Client {
+	return NewTestClient(func(req *http.Request) (*http.Response, error) {
+		var body map[string]any
+		_ = json.NewDecoder(req.Body).Decode(&body)
+		prompt, _ := body["prompt"].(string)
+		started <- prompt
+		select {
+		case <-req.Context().Done():
+			aborted <- prompt
+			return nil, req.Context().Err()
+		case <-release:
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader([]byte(`{"ok":true}`))), Header: make(http.Header)}, nil
+		}
+	})
+}
+
+func TestWorker_CancelsInFlightRequest(t *testing.T) {
+	started := make(chan string, 2)
+	aborted := make(chan string, 2)
+	release := make(chan struct{})
+	inferenceClient := NewHTTPInferenceClient(blockingInferenceHandler(started, aborted, release))
+
+	requestChannel := make(chan pipeline.EmbelishedRequestMessage, 2)
+	retryChannel := make(chan pipeline.RetryMessage, 2)
+	resultChannel := make(chan asyncapi.ResultMessage, 2)
+	checker := &stubCancellationChecker{cancelled: map[string]bool{}}
+	ctx := WithCancellationChecker(context.Background(), checker)
+
+	// Two workers so the cancelled and the surviving request execute concurrently.
+	for range 2 {
+		go Worker(ctx, ctx, pipeline.Characteristics{}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil)
+	}
+	for _, id := range []string{"inflight-cancelled", "inflight-survivor"} {
+		requestChannel <- newEmbR(asyncapi.InternalRouting{RequestToken: "token-" + id}, asyncapi.RequestMessage{
+			ID:       id,
+			Created:  time.Now().Unix(),
+			Deadline: time.Now().Add(30 * time.Second).Unix(),
+			Payload:  map[string]any{"model": "test", "prompt": id},
+		}, "http://localhost:30800/v1/completions", nil)
+	}
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("inference never started")
+		}
+	}
+
+	checker.setCancelled("inflight-cancelled", "token-inflight-cancelled", true)
+
+	select {
+	case id := <-aborted:
+		if id != "inflight-cancelled" {
+			t.Fatalf("expected only the cancelled request to be aborted, got %q", id)
+		}
+	case <-time.After(2*cancellationCheckPollInterval + time.Second):
+		t.Fatal("in-flight request context was not cancelled")
+	}
+	select {
+	case result := <-resultChannel:
+		if result.ID != "inflight-cancelled" || result.ErrorCode != asyncapi.ErrCodeCancelled {
+			t.Fatalf("expected CANCELLED result for inflight-cancelled, got %+v", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for cancelled result")
+	}
+
+	close(release)
+	select {
+	case result := <-resultChannel:
+		if result.ID != "inflight-survivor" || result.StatusCode != http.StatusOK {
+			t.Fatalf("expected successful result for inflight-survivor, got %+v", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for surviving request result")
+	}
+
+	// The cancelled request must not be retried or produce a second result.
+	select {
+	case msg := <-retryChannel:
+		t.Fatalf("cancelled request should not be retried, got %q", msg.PublicRequest.ReqID())
+	case result := <-resultChannel:
+		t.Fatalf("expected exactly one result per request, got extra %+v", result)
+	case <-time.After(cancellationCheckPollInterval + 100*time.Millisecond):
+	}
+}
+
+func TestWorker_InFlightCancellationIgnoresOtherGenerations(t *testing.T) {
+	for name, checker := range map[string]*stubCancellationChecker{
+		// A stale marker for a previous generation reusing the same request ID.
+		"stale token": {cancelled: map[string]bool{"reused-id|token-old": true}},
+		// A marker lookup failure must not abort the executing request.
+		"check error": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			started := make(chan string, 1)
+			aborted := make(chan string, 1)
+			release := make(chan struct{})
+			inferenceClient := NewHTTPInferenceClient(blockingInferenceHandler(started, aborted, release))
+
+			requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+			retryChannel := make(chan pipeline.RetryMessage, 1)
+			resultChannel := make(chan asyncapi.ResultMessage, 1)
+			ctx := WithCancellationChecker(context.Background(), checker)
+
+			go Worker(ctx, ctx, pipeline.Characteristics{}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil)
+			requestChannel <- newEmbR(asyncapi.InternalRouting{RequestToken: "token-new"}, asyncapi.RequestMessage{
+				ID:       "reused-id",
+				Created:  time.Now().Unix(),
+				Deadline: time.Now().Add(30 * time.Second).Unix(),
+				Payload:  map[string]any{"model": "test", "prompt": "hi"},
+			}, "http://localhost:30800/v1/completions", nil)
+
+			select {
+			case <-started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("inference never started")
+			}
+			if name == "check error" {
+				checker.mu.Lock()
+				checker.err = fmt.Errorf("redis unavailable")
+				checker.mu.Unlock()
+			}
+
+			// Let at least one in-flight poll run before completing the request.
+			time.Sleep(cancellationCheckPollInterval + 200*time.Millisecond)
+			close(release)
+
+			select {
+			case <-aborted:
+				t.Fatal("request must not be aborted")
+			case <-retryChannel:
+				t.Fatal("request must not be retried")
+			case result := <-resultChannel:
+				if result.StatusCode != http.StatusOK {
+					t.Fatalf("expected successful result, got %+v", result)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("timeout waiting for result")
+			}
+			if got := checker.checkCount(); got < 2 {
+				t.Fatalf("expected the marker to be polled during inference, got %d checks", got)
+			}
+		})
+	}
+}
+
+// blockingCancellationChecker answers immediately until armed, then blocks
+// every lookup until unblock is closed, ignoring ctx like the Redis client does
+// without ContextTimeoutEnabled.
+type blockingCancellationChecker struct {
+	armed   atomic.Bool
+	entered chan struct{}
+	unblock chan struct{}
+}
+
+func (b *blockingCancellationChecker) IsCancelled(ctx context.Context, requestID, requestToken string) (bool, error) {
+	if !b.armed.Load() {
+		return false, nil
+	}
+	select {
+	case b.entered <- struct{}{}:
+	default:
+	}
+	<-b.unblock
+	return false, nil
+}
+
+// A marker lookup still in flight when the send completes must not delay the
+// result: the worker emits it without waiting for a slow Redis to answer.
+func TestWorker_SlowInFlightCheckDoesNotDelayResult(t *testing.T) {
+	started := make(chan string, 1)
+	aborted := make(chan string, 1)
+	release := make(chan struct{})
+	inferenceClient := NewHTTPInferenceClient(blockingInferenceHandler(started, aborted, release))
+
+	requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+	retryChannel := make(chan pipeline.RetryMessage, 1)
+	resultChannel := make(chan asyncapi.ResultMessage, 1)
+	checker := &blockingCancellationChecker{entered: make(chan struct{}, 1), unblock: make(chan struct{})}
+	t.Cleanup(func() { close(checker.unblock) })
+	ctx := WithCancellationChecker(context.Background(), checker)
+
+	go Worker(ctx, ctx, pipeline.Characteristics{}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil)
+	requestChannel <- newEmbR(asyncapi.InternalRouting{RequestToken: "token-slow"}, asyncapi.RequestMessage{
+		ID:       "slow-check",
+		Created:  time.Now().Unix(),
+		Deadline: time.Now().Add(30 * time.Second).Unix(),
+		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+	}, "http://localhost:30800/v1/completions", nil)
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("inference never started")
+	}
+	checker.armed.Store(true)
+	select {
+	case <-checker.entered:
+	case <-time.After(2*cancellationCheckPollInterval + time.Second):
+		t.Fatal("in-flight marker lookup never started")
+	}
+
+	// The send completes while the lookup is still blocked.
+	close(release)
+	select {
+	case result := <-resultChannel:
+		if result.StatusCode != http.StatusOK {
+			t.Fatalf("expected successful result, got %+v", result)
+		}
+	case <-aborted:
+		t.Fatal("request must not be aborted")
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("result was held up by the in-flight marker lookup")
+	}
+}
+
 type raceMockPoolGate struct {
 	releaseCalled *int32
 }
