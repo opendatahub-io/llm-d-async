@@ -387,6 +387,9 @@ This test floods the inference gateway with interactive requests to saturate
 vLLM, then verifies that the dispatch budget gate closes and async requests
 queue. When the load stops, the gate re-opens and queued requests drain.
 
+The Redis probes below run a shell inside a pod. They pass `REDIS_HOST` with `--env`
+so that shell can resolve the Redis service configured on the host.
+
 Two load generators are available:
 - **hey** (`docs/guides/e2e-deploy/hey-loadtest.yaml`) — simple HTTP load generator, 200 concurrent workers
 - **guidellm** (`docs/guides/e2e-deploy/guidellm-loadtest.yaml`) — LLM-specific load testing with synthetic
@@ -414,7 +417,8 @@ kubectl run --rm -i prom-budget --image=curlimages/curl --restart=Never -n ${NAM
 # Expected: value = -1 (200 running / 100 max = 200% utilization)
 
 # 3. Push async requests while gate is closed
-kubectl run --rm -i push-async --image=redis --restart=Never -n ${NAMESPACE} -- \
+kubectl run --rm -i push-async --image=redis --restart=Never -n ${NAMESPACE} \
+    --env="REDIS_HOST=${REDIS_HOST}" -- \
     sh -c 'for i in 1 2 3 4 5; do
       redis-cli -h ${REDIS_HOST} ZADD request-sortedset 1999999999 \
         "{\"request_kind\":\"redis\",\"internal\":{},\"data\":{\"id\":\"sat-$i\",\"created\":1700000000,\"deadline\":1999999999,\"payload\":{\"model\":\"Qwen/Qwen3-0.6B\",\"prompt\":\"Count slowly.\",\"max_tokens\":128}}}"
@@ -422,7 +426,8 @@ kubectl run --rm -i push-async --image=redis --restart=Never -n ${NAMESPACE} -- 
 
 # 4. Verify requests stay queued (gate closed, no dispatch)
 sleep 10
-kubectl run --rm -i check-queued --image=redis --restart=Never -n ${NAMESPACE} -- \
+kubectl run --rm -i check-queued --image=redis --restart=Never -n ${NAMESPACE} \
+    --env="REDIS_HOST=${REDIS_HOST}" -- \
     sh -c 'echo "queue: $(redis-cli -h ${REDIS_HOST} ZCARD request-sortedset)"; echo "results: $(redis-cli -h ${REDIS_HOST} LLEN result-list)"'
 # Expected: queue: 5, results: 0
 
@@ -432,7 +437,8 @@ kubectl delete job hey-loadtest -n ${NAMESPACE}
 # Wait for Prometheus to scrape idle state + gate to open (~30s)
 sleep 30
 
-kubectl run --rm -i check-drained --image=redis --restart=Never -n ${NAMESPACE} -- \
+kubectl run --rm -i check-drained --image=redis --restart=Never -n ${NAMESPACE} \
+    --env="REDIS_HOST=${REDIS_HOST}" -- \
     sh -c 'echo "queue: $(redis-cli -h ${REDIS_HOST} ZCARD request-sortedset)"; echo "results: $(redis-cli -h ${REDIS_HOST} LLEN result-list)"'
 # Expected: queue: 0, results: 5
 ```
@@ -459,7 +465,8 @@ kubectl run --rm -i prom-budget --image=curlimages/curl --restart=Never -n ${NAM
 # Expected: value ~= -0.1 (gate closed)
 
 # 3. Push async requests while gate is closed
-kubectl run --rm -i push-async --image=redis --restart=Never -n ${NAMESPACE} -- \
+kubectl run --rm -i push-async --image=redis --restart=Never -n ${NAMESPACE} \
+    --env="REDIS_HOST=${REDIS_HOST}" -- \
     sh -c 'for i in 1 2 3 4 5; do
       redis-cli -h ${REDIS_HOST} ZADD request-sortedset 1999999999 \
         "{\"request_kind\":\"redis\",\"internal\":{},\"data\":{\"id\":\"gl-$i\",\"created\":1700000000,\"deadline\":1999999999,\"payload\":{\"model\":\"Qwen/Qwen3-0.6B\",\"prompt\":\"Count slowly.\",\"max_tokens\":128}}}"
@@ -467,7 +474,8 @@ kubectl run --rm -i push-async --image=redis --restart=Never -n ${NAMESPACE} -- 
 
 # 4. Verify requests stay queued (gate closed, no dispatch)
 sleep 10
-kubectl run --rm -i check-queued --image=redis --restart=Never -n ${NAMESPACE} -- \
+kubectl run --rm -i check-queued --image=redis --restart=Never -n ${NAMESPACE} \
+    --env="REDIS_HOST=${REDIS_HOST}" -- \
     sh -c 'echo "queue: $(redis-cli -h ${REDIS_HOST} ZCARD request-sortedset)"; echo "results: $(redis-cli -h ${REDIS_HOST} LLEN result-list)"'
 # Expected: queue: 5, results: 0
 
@@ -477,7 +485,8 @@ kubectl delete job guidellm-loadtest -n ${NAMESPACE}
 # Wait ~60s for vLLM to drain in-flight requests + Prometheus scrape + gate to open
 sleep 60
 
-kubectl run --rm -i check-drained --image=redis --restart=Never -n ${NAMESPACE} -- \
+kubectl run --rm -i check-drained --image=redis --restart=Never -n ${NAMESPACE} \
+    --env="REDIS_HOST=${REDIS_HOST}" -- \
     sh -c 'echo "queue: $(redis-cli -h ${REDIS_HOST} ZCARD request-sortedset)"; echo "results: $(redis-cli -h ${REDIS_HOST} LLEN result-list)"'
 # Expected: queue: 0, results: 5
 ```

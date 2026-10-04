@@ -66,9 +66,11 @@ type RedisRequest struct {
 
 // PubSubRequest is the concrete Request implementation for GCP Pub/Sub flows.
 // Optional PubSubID is merged into InternalRouting.TransportCorrelationID in producers.
+// Optional ResultQueueName names the result topic for this message.
 type PubSubRequest struct {
 	RequestMessage
-	PubSubID string `json:"pubsub_id,omitempty"`
+	PubSubID        string `json:"pubsub_id,omitempty"`
+	ResultQueueName string `json:"result_queue_name,omitempty"`
 }
 
 var (

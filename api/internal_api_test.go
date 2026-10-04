@@ -130,8 +130,9 @@ func TestRoundTrip_PubSubRequest(t *testing.T) {
 	ir := NewInternalRequest(
 		InternalRouting{TransportCorrelationID: "corr-123"},
 		&PubSubRequest{
-			RequestMessage: RequestMessage{ID: "ps-1", Created: 10, Deadline: 20},
-			PubSubID:       "pub-abc",
+			RequestMessage:  RequestMessage{ID: "ps-1", Created: 10, Deadline: 20},
+			PubSubID:        "pub-abc",
+			ResultQueueName: "per-msg-results",
 		},
 	)
 	b, err := json.Marshal(ir)
@@ -149,7 +150,7 @@ func TestRoundTrip_PubSubRequest(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *PubSubRequest, got %T", got.PublicRequest)
 	}
-	if ps.ID != "ps-1" || ps.PubSubID != "pub-abc" {
+	if ps.ID != "ps-1" || ps.PubSubID != "pub-abc" || ps.ResultQueueName != "per-msg-results" {
 		t.Errorf("field mismatch: %+v", ps)
 	}
 }
