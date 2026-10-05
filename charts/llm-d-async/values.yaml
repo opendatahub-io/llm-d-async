@@ -184,7 +184,7 @@ ap:
     requestPathURL: "/v1/completions"
     # Full multi-topic configuration (overrides single-topic fields above).
     # Each entry supports its own subscriber_id, worker_pool_id, inference_objective,
-    # request_path_url, igw_base_url, gate_type and gate_params.
+    # request_path_url, igw_base_url, result_topic_id, gate_type and gate_params.
     # topicsConfig:
     #   - subscriber_id: "projects/my-project/subscriptions/sub-1"
     #     worker_pool_id: "default"

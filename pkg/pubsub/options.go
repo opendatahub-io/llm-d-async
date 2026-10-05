@@ -10,7 +10,10 @@ import (
 // Config is the transport config for the GCP PubSub flow.
 // It is parsed from JSON provided via --transport-config or --transport-config-file.
 type Config struct {
-	ProjectID     string        `json:"project_id"`
+	ProjectID string `json:"project_id"`
+	// ResultTopicID is the flow-level default result topic. It is used when
+	// neither the topic entry nor the message names a destination, and may be
+	// omitted only when every topic entry sets its own result_topic_id.
 	ResultTopicID string        `json:"result_topic_id"`
 	BatchSize     int           `json:"batch_size,omitempty"`
 	Topics        []TopicConfig `json:"topics"`
@@ -47,14 +50,14 @@ func (c *Config) Validate() error {
 	if c.ProjectID == "" {
 		return fmt.Errorf("project_id is required for gcp-pubsub transport")
 	}
-	if c.ResultTopicID == "" {
-		return fmt.Errorf("result_topic_id is required for gcp-pubsub transport")
-	}
 	if c.BatchSize <= 0 {
 		return fmt.Errorf("batch_size must be a positive integer, got %d", c.BatchSize)
 	}
 	if len(c.Topics) == 0 {
 		return fmt.Errorf("at least one topic must be configured")
+	}
+	if c.ResultTopicID == "" && !c.allTopicsHaveResultTopic() {
+		return fmt.Errorf("result_topic_id is required for gcp-pubsub transport unless every topic sets its own result_topic_id")
 	}
 	for _, t := range c.Topics {
 		if t.SubscriberID == "" {
@@ -65,6 +68,17 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// allTopicsHaveResultTopic reports whether every topic entry overrides the
+// result destination, which makes the flow-level default unreachable.
+func (c *Config) allTopicsHaveResultTopic() bool {
+	for _, t := range c.Topics {
+		if t.ResultTopicID == "" {
+			return false
+		}
+	}
+	return true
 }
 
 // Options holds CLI flags for the GCP PubSub flow.

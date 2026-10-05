@@ -13,6 +13,7 @@ import (
 	"cloud.google.com/go/monitoring/apiv3/v2/monitoringpb"
 	"cloud.google.com/go/pubsub/v2"
 	"cloud.google.com/go/pubsub/v2/apiv1/pubsubpb"
+	"github.com/go-logr/logr"
 	"github.com/llm-d/llm-d-async/api"
 	"github.com/llm-d/llm-d-async/pipeline"
 	"github.com/llm-d/llm-d-async/pkg/metrics"
@@ -36,6 +37,10 @@ type TopicConfig struct {
 	InferenceObjective string `json:"inference_objective"`
 	RequestPathURL     string `json:"request_path_url"`
 	IGWBaseURL         string `json:"igw_base_url"`
+	// ResultTopicID, when set, routes results for requests pulled from this
+	// topic's subscription to this topic instead of the flow-level default. It
+	// takes precedence over a per-message result_queue_name.
+	ResultTopicID string `json:"result_topic_id,omitempty"`
 	pipeline.GateConfig
 	Labels map[string]string `json:"labels,omitempty"`
 }
@@ -82,6 +87,7 @@ type RequestChannelData struct {
 	subscriberID   string
 	gate           pipeline.Gate
 	labels         map[string]string
+	resultTopicID  string
 }
 
 // NewGCPPubSubMQFlow builds a GCP Pub/Sub flow from a parsed Config. The config
@@ -174,9 +180,10 @@ func NewGCPPubSubMQFlow(cfg Config, workerPools []pipeline.WorkerPoolConfig, gat
 				Gate:               gate,
 				WorkerPoolID:       workerPoolID,
 			},
-			subscriberID: cfg.SubscriberID,
-			gate:         gate,
-			labels:       cfg.Labels,
+			subscriberID:  cfg.SubscriberID,
+			gate:          gate,
+			labels:        cfg.Labels,
+			resultTopicID: cfg.ResultTopicID,
 		})
 		p.consumeHealth[cfg.SubscriberID] = &subHealth{}
 	}
@@ -309,12 +316,11 @@ func (r *PubSubMQFlow) Start(ctx context.Context) {
 		r.consumeWg.Add(1)
 		go func(cd RequestChannelData) {
 			defer r.consumeWg.Done()
-			r.requestWorker(consumeCtx, pubSubClient, cd.subscriberID, cd.requestChannel.WorkerPoolID, cd.requestChannel.Channel, cd.gate, cd.labels)
+			r.requestWorker(consumeCtx, pubSubClient, cd.subscriberID, cd.requestChannel.WorkerPoolID, cd.requestChannel.Channel, cd.gate, cd.labels, cd.resultTopicID)
 		}(channelData)
 	}
-	publisher := pubSubClient.Publisher(r.resultTopicID)
 	r.drainWg.Add(2)
-	go func() { defer r.drainWg.Done(); resultWorker(drainCtx, publisher, r.resultChannel) }()
+	go func() { defer r.drainWg.Done(); resultWorker(drainCtx, pubSubClient, r.resultTopicID, r.resultChannel) }()
 	go func() { defer r.drainWg.Done(); addMsgToRetryQueue(drainCtx, r.retryChannel) }()
 }
 
@@ -425,8 +431,28 @@ func (r *PubSubMQFlow) QueueBacklog(ctx context.Context) ([]pipeline.QueueBacklo
 
 var _ pipeline.BacklogReporter = (*PubSubMQFlow)(nil)
 
-func resultWorker(ctx context.Context, publisher *pubsub.Publisher, resultChannel chan api.ResultMessage) {
+// resultWorker publishes each result to the topic resolved at pull time
+// (msg.Routing.ResultQueueName), falling back to defaultTopicID. One Publisher
+// is cached per distinct result topic and stopped, flushing pending
+// publishes, when the worker exits.
+//
+// The request is only reported as done (and Acked) once the server has
+// accepted its result. A publish that fails, e.g. to a topic that does not
+// exist or that the service account cannot publish to, reports false so the
+// request is Nacked and redelivered instead of losing its result.
+func resultWorker(ctx context.Context, client *pubsub.Client, defaultTopicID string, resultChannel chan api.ResultMessage) {
 	logger := log.FromContext(ctx)
+
+	publishers := make(map[string]*pubsub.Publisher)
+	var pending sync.WaitGroup
+	defer func() {
+		// Stop returns once every outstanding publish has been sent or has
+		// failed, so the pending result waiters below finish promptly.
+		for _, p := range publishers {
+			p.Stop()
+		}
+		pending.Wait()
+	}()
 
 	for {
 		select {
@@ -434,6 +460,21 @@ func resultWorker(ctx context.Context, publisher *pubsub.Publisher, resultChanne
 			return
 
 		case msg := <-resultChannel:
+			correlationID := msg.Routing.TransportCorrelationID
+			topicID := msg.Routing.ResultQueueName
+			if topicID == "" {
+				topicID = defaultTopicID
+			}
+			if topicID == "" {
+				logger.V(logutil.DEFAULT).Error(nil, "No result topic resolved for message", "id", msg.ID, "pubsubID", correlationID)
+				signalPublished(logger, correlationID, false)
+				continue
+			}
+			publisher, ok := publishers[topicID]
+			if !ok {
+				publisher = client.Publisher(topicID)
+				publishers[topicID] = publisher
+			}
 			bytes, err := json.Marshal(msg)
 			var msgBytes []byte
 			if err != nil {
@@ -442,26 +483,41 @@ func resultWorker(ctx context.Context, publisher *pubsub.Publisher, resultChanne
 			} else {
 				msgBytes = bytes
 			}
-			publishPubSub(ctx, publisher, msgBytes, map[string]string{})
-			value, ok := resultChannels.Load(msg.Routing.TransportCorrelationID)
-			if !ok {
-				logger.V(logutil.DEFAULT).Error(nil, "Result channel not found for message", "pubsubID", msg.Routing.TransportCorrelationID)
-				continue
-			}
-			resultChannel := value.(chan bool)
-			resultChannel <- true
+			res := publishPubSub(ctx, publisher, msgBytes, map[string]string{})
 
+			// Wait for the server's answer off the loop so publishes keep
+			// batching. The wait is detached from ctx: on shutdown Stop flushes
+			// the publish, and its real outcome decides Ack vs. Nack.
+			pending.Add(1)
+			go func(id string) {
+				defer pending.Done()
+				if _, err := res.Get(context.WithoutCancel(ctx)); err != nil {
+					logger.V(logutil.DEFAULT).Error(err, "Failed to publish result", "id", id, "topic", topicID, "pubsubID", correlationID)
+					signalPublished(logger, correlationID, false)
+					return
+				}
+				signalPublished(logger, correlationID, true)
+			}(msg.ID)
 		}
 	}
 }
 
-func publishPubSub(ctx context.Context, publisher *pubsub.Publisher, msg []byte, attrs map[string]string) {
-	// TODO: check how to validate that message are actually being published
-	publisher.Publish(ctx, &pubsub.Message{
+// signalPublished tells the receive callback waiting on correlationID whether
+// its result was published, so it Acks or Nacks the request.
+func signalPublished(logger logr.Logger, correlationID string, published bool) {
+	value, ok := resultChannels.Load(correlationID)
+	if !ok {
+		logger.V(logutil.DEFAULT).Error(nil, "Result channel not found for message", "pubsubID", correlationID)
+		return
+	}
+	value.(chan bool) <- published
+}
+
+func publishPubSub(ctx context.Context, publisher *pubsub.Publisher, msg []byte, attrs map[string]string) *pubsub.PublishResult {
+	return publisher.Publish(ctx, &pubsub.Message{
 		Data:       msg,
 		Attributes: attrs,
 	})
-
 }
 
 func addMsgToRetryQueue(ctx context.Context, retryChannel chan pipeline.RetryMessage) {
@@ -499,7 +555,7 @@ func addMsgToRetryQueue(ctx context.Context, retryChannel chan pipeline.RetryMes
 	}
 }
 
-func (r *PubSubMQFlow) requestWorker(ctx context.Context, pubSubClient *pubsub.Client, subscriberID, poolID string, ch chan *api.InternalRequest, gate pipeline.Gate, labels map[string]string) {
+func (r *PubSubMQFlow) requestWorker(ctx context.Context, pubSubClient *pubsub.Client, subscriberID, poolID string, ch chan *api.InternalRequest, gate pipeline.Gate, labels map[string]string, resultTopicID string) {
 	logger := log.FromContext(ctx)
 
 	sub := pubSubClient.Subscriber(subscriberID)
@@ -544,7 +600,7 @@ func (r *PubSubMQFlow) requestWorker(ctx context.Context, pubSubClient *pubsub.C
 			continue
 		}
 
-		err := r.processMessages(receiveCtx, sub.Receive, subscriberID, poolID, ch, gate, labels)
+		err := r.processMessages(receiveCtx, sub.Receive, subscriberID, poolID, ch, gate, labels, resultTopicID)
 
 		cancel()
 		// TODO
@@ -563,25 +619,33 @@ func (r *PubSubMQFlow) requestWorker(ctx context.Context, pubSubClient *pubsub.C
 
 type receiveFunc func(context.Context, func(context.Context, *pubsub.Message)) error
 
-func (r *PubSubMQFlow) processMessages(ctx context.Context, receive receiveFunc, subscriberID string, poolID string, ch chan *api.InternalRequest, gate pipeline.Gate, labels map[string]string) error {
+func (r *PubSubMQFlow) processMessages(ctx context.Context, receive receiveFunc, subscriberID string, poolID string, ch chan *api.InternalRequest, gate pipeline.Gate, labels map[string]string, resultTopicID string) error {
 	logger := log.FromContext(ctx)
 	return receive(ctx, func(ctx context.Context, msg *pubsub.Message) {
 		// A delivered message is authoritative proof the broker round-tripped;
 		// refresh the passive health signal read by HealthCheck.
 		r.recordConsumeOK(subscriberID)
 
-		var body api.RequestMessage
-		err := json.Unmarshal(msg.Data, &body)
+		var wire api.PubSubRequest
+		err := json.Unmarshal(msg.Data, &wire)
 		if err != nil {
 			logger.V(logutil.DEFAULT).Error(err, "Failed to unmarshal message from request queue")
 			msg.Ack()
 			return
 		}
+		body := wire.RequestMessage
 
 		// Carry the subscription as the request queue label so all per-queue
 		// metrics (throughput, depth, inflight, latency) align with the
 		// async_broker_backlog gauge, which is keyed by subscription ID.
 		irout := api.InternalRouting{TransportCorrelationID: msg.ID, RequestQueueName: subscriberID}
+		// Resolve the result destination with the sorted-set precedence:
+		// per-topic config > per-message result_queue_name > flow default
+		// (applied by resultWorker when this is left empty).
+		irout.ResultQueueName = wire.ResultQueueName
+		if resultTopicID != "" {
+			irout.ResultQueueName = resultTopicID
+		}
 		if msg.DeliveryAttempt != nil {
 			irout.RetryCount = *msg.DeliveryAttempt - 1
 		}

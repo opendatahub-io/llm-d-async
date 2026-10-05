@@ -301,7 +301,7 @@ Queue hot reload is enabled with `--transport redis-sortedset --transport-config
 | `batch_size` | redis-sortedset, gcp-pubsub | `10` | Messages per poll (sortedset) / inflight messages (Pub/Sub). |
 | `enable_tracing` | redis-* | `false` | Per-command Redis tracing spans via `redisotel`. High span volume — debugging only. |
 | `project_id` | gcp-pubsub | — | GCP project ID (required). |
-| `result_topic_id` | gcp-pubsub | — | Results topic ID (required). |
+| `result_topic_id` | gcp-pubsub | — | Default results topic ID. Required unless every topic entry sets its own `result_topic_id`. |
 | `queues` / `topics` | all | — | Array of queue/topic entries (at least one required). See below. |
 
 ### Queue and Topic Entry Fields
@@ -348,6 +348,14 @@ Each entry in `queues`/`topics` describes one request source and where its reque
 | `id` | no | `queue_name` | Unique queue identifier; becomes the `queue_id` metric label. |
 | `result_queue_name` | no | top-level `result_queue_name` | Per-queue result destination override. |
 | `result_ttl_seconds` | no | `0` (no expiry) | When > 0, sets an expiry on the result destination each time results are pushed. Used for per-request result keys (frontend enqueue mode) so unfetched results are cleaned up. |
+
+**Additional fields (`gcp-pubsub` only):**
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `result_topic_id` | no | top-level `result_topic_id` | Per-topic result destination override. |
+
+**Result routing precedence (`redis-sortedset` and `gcp-pubsub`):** the per-queue/per-topic result destination wins; otherwise the per-message `ResultQueueName` (`result_queue_name` on `api.RedisRequest` / `api.PubSubRequest`; a result topic on `gcp-pubsub`) is used; otherwise results go to the top-level default.
 
 ### Worker Pools Configuration
 
@@ -870,6 +878,7 @@ The Async Processor exposes Prometheus metrics under the `llm_d_async` subsystem
 | Metric | Type | Description |
 |--------|------|-------------|
 | `llm_d_async_async_queue_depth` | Gauge | Requests received from the broker and buffered in-process awaiting an available worker |
+| `llm_d_async_async_gate_waiting_requests` | Gauge | Requests currently held by workers waiting for the pool dispatch gate to admit them (blocked in gate-wait). |
 | `llm_d_async_async_inflight_requests` | Gauge | Requests currently being processed by workers (dispatched to inference, awaiting a response) |
 | `llm_d_async_async_broker_backlog` | Gauge | Undelivered/pending messages held by the broker queue (polled every `metrics-backlog-poll-interval`; `redis-sortedset` and `gcp-pubsub` only). A zero is trustworthy only when the matching source-availability gauge is `1`. |
 | `llm_d_async_async_broker_backlog_source_available` | Gauge | `1` when the most recent broker-backlog read succeeded; `0` when the source was unavailable or errored. |

@@ -131,7 +131,7 @@ func TestProcessMessages_QuotaGating(t *testing.T) {
 				}
 			}()
 
-			_ = flow.processMessages(ctx, receive, "test-sub", "test-pool", ch, gate, nil)
+			_ = flow.processMessages(ctx, receive, "test-sub", "test-pool", ch, gate, nil, "")
 		})
 	}
 }
@@ -261,7 +261,7 @@ func TestProcessMessages_LabelsPropagation(t *testing.T) {
 		}
 	}()
 
-	_ = flow.processMessages(ctx, receive, "test-sub", "test-pool", ch, gate, labels)
+	_ = flow.processMessages(ctx, receive, "test-sub", "test-pool", ch, gate, labels, "")
 	<-done
 }
 
@@ -272,6 +272,14 @@ const testProject = "test-project"
 // also runs on test cleanup. Optional reactors (e.g. pstest error injection)
 // customize server responses.
 func newFakePubSub(t *testing.T, reactors ...pstest.ServerReactorOption) (*pubsub.Client, func()) {
+	t.Helper()
+	_, client, closeSrv := newFakePubSubServer(t, reactors...)
+	return client, closeSrv
+}
+
+// newFakePubSubServer is newFakePubSub that also exposes the fake server, so
+// tests can inspect what was published.
+func newFakePubSubServer(t *testing.T, reactors ...pstest.ServerReactorOption) (*pstest.Server, *pubsub.Client, func()) {
 	t.Helper()
 	srv := pstest.NewServer(reactors...)
 	var once sync.Once
@@ -287,7 +295,7 @@ func newFakePubSub(t *testing.T, reactors ...pstest.ServerReactorOption) (*pubsu
 		t.Fatalf("failed to create fake pubsub client: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Close() })
-	return client, closeSrv
+	return srv, client, closeSrv
 }
 
 // createSubscription provisions a topic and subscription on the fake so that an
