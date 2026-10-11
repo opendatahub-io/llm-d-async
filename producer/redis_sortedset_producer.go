@@ -22,27 +22,27 @@ var (
 // RedisSortedSetProducer implements Producer using Redis sorted set for requests
 // and Redis list for results.
 type RedisSortedSetProducer struct {
-	client                     *redis.Client
-	managedClient              bool
+	client        redis.UniversalClient
+	managedClient bool
+	// clusterKeys selects the hash-tagged layout for private keys (enqueue
+	// sequence, result claims) so each script stays within one Redis
+	// Cluster slot, and splits the per-request markers out of scripts.
+	clusterKeys                bool
 	requestQueueName           string
 	resultQueueName            string
 	resultClaimLeaseTTL        time.Duration
 	resultClaimReclaimInterval time.Duration
+	payloadKeys                bool
 }
 
-const cancellationMarkerTTL = 7 * 24 * time.Hour
-
-var markRequestCancelledScript = redis.NewScript(`
-local active = redis.call("GET", KEYS[1])
-if not active then
-  return 0
-end
-redis.call("SET", KEYS[2], active, "EX", ARGV[1])
-return 1
-`)
+const (
+	cancellationMarkerTTL = 7 * 24 * time.Hour
+	payloadTTLGrace       = 10 * time.Minute
+)
 
 // submitRequestScript assigns the enqueue sequence and enqueues the request
 // as ARGV[4] .. seq .. ARGV[5], scored as api.InternalRequest.QueueScore.
+// Standalone only: its keys span several cluster slots.
 var submitRequestScript = redis.NewScript(`
 local seq = redis.call("INCR", KEYS[1])
 redis.call("EXPIREAT", KEYS[1], ARGV[3])
@@ -50,6 +50,21 @@ redis.call("DEL", KEYS[2])
 redis.call("SET", KEYS[3], ARGV[1], "PX", ARGV[2])
 local score = tonumber(ARGV[6]) + math.min(seq, 2097151) / 2097152
 redis.call("ZADD", KEYS[4], string.format("%.17g", score), ARGV[4] .. seq .. ARGV[5])
+if KEYS[5] then
+  redis.call("SET", KEYS[5], ARGV[7], "PX", ARGV[8])
+end
+return seq
+`)
+
+// enqueueRequestScript is the cluster-mode half of submitRequestScript: the
+// sequence counter and the queue share a slot, while the per-request markers
+// are written beforehand with single-key commands.
+// KEYS: seq, queue. ARGV: seqExpireAt, jsonBefore, jsonAfter, deadline.
+var enqueueRequestScript = redis.NewScript(`
+local seq = redis.call("INCR", KEYS[1])
+redis.call("EXPIREAT", KEYS[1], ARGV[1])
+local score = tonumber(ARGV[4]) + math.min(seq, 2097151) / 2097152
+redis.call("ZADD", KEYS[2], string.format("%.17g", score), ARGV[2] .. seq .. ARGV[3])
 return seq
 `)
 
@@ -60,18 +75,22 @@ const (
 	enqueueSeqGrace           = time.Hour
 )
 
-func enqueueSeqKey(queueName string, deadline int64) string {
-	return fmt.Sprintf("request-seq:%s:%d", queueName, deadline)
+// enqueueSeqKey names the per-queue, per-deadline sequence counter. In
+// cluster mode the queue segment is hash-tagged so the counter shares the
+// queue's slot and the enqueue stays atomic.
+func enqueueSeqKey(queueName string, deadline int64, cluster bool) string {
+	return fmt.Sprintf("request-seq:%s:%d", slotKey(queueName, cluster), deadline)
 }
 
 // ProducerOption is a functional option for NewRedisSortedSetProducer.
 type ProducerOption func(*RedisSortedSetProducer) error
 
-// WithRedisClient injects a pre-configured *redis.Client, allowing callers to
-// instrument it (e.g. with OpenTelemetry tracing/metrics hooks) before use.
-// When provided, RedisURL in the config is not required.
+// WithRedisClient injects a pre-configured client (standalone, cluster or
+// failover), allowing callers to instrument it (e.g. with OpenTelemetry
+// tracing/metrics hooks) before use. When provided, RedisURL and the other
+// Redis* fields in the config are not required.
 // The caller retains ownership of the client; Close() will not close it.
-func WithRedisClient(client *redis.Client) ProducerOption {
+func WithRedisClient(client redis.UniversalClient) ProducerOption {
 	return func(p *RedisSortedSetProducer) error {
 		if client == nil {
 			return errors.New("WithRedisClient: client must not be nil")
@@ -105,11 +124,32 @@ func WithResultClaimReclaimInterval(interval time.Duration) ProducerOption {
 	}
 }
 
+// WithPayloadKeys stores each request's payload under its own Redis key.
+func WithPayloadKeys() ProducerOption {
+	return func(p *RedisSortedSetProducer) error {
+		p.payloadKeys = true
+		return nil
+	}
+}
+
 // RedisSortedSetConfig contains configuration for the Redis sorted set producer.
 type RedisSortedSetConfig struct {
 	// RedisURL is a Redis URL (e.g. "redis://user:pass@host:port/db" or "rediss://..." for TLS).
 	// Required unless a client is injected via WithRedisClient.
 	RedisURL string
+
+	// RedisMode selects the topology: RedisModeStandalone (default),
+	// RedisModeCluster or RedisModeSentinel. Credentials, TLS and tuning
+	// still come from RedisURL. Ignored when a client is injected.
+	RedisMode string
+
+	// RedisAddrs lists additional cluster seed nodes or sentinel addresses
+	// beyond the host in RedisURL. Only valid with cluster or sentinel mode.
+	RedisAddrs []string
+
+	// RedisMasterName is the sentinel-monitored master. Required in
+	// sentinel mode.
+	RedisMasterName string
 
 	// RequestQueueName is the name of the Redis sorted set for requests.
 	// Typically shared across all tenants.
@@ -147,16 +187,14 @@ func NewRedisSortedSetProducer(config RedisSortedSetConfig, opts ...ProducerOpti
 	}
 
 	if p.client == nil {
-		if config.RedisURL == "" {
-			return nil, errors.New("RedisURL is required when no RedisClient is provided via WithRedisClient")
-		}
-		redisOpts, err := redis.ParseURL(config.RedisURL)
+		client, err := newRedisClient(config)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse RedisURL: %w", err)
+			return nil, err
 		}
-		p.client = redis.NewClient(redisOpts)
+		p.client = client
 		p.managedClient = true
 	}
+	p.clusterKeys = isClusterClient(p.client)
 
 	// Test connection
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -213,6 +251,7 @@ func toInternalRequest(req api.Request) *api.InternalRequest {
 			Metadata: req.ReqMetadata(),
 			Headers:  req.ReqHeaders(),
 			Endpoint: req.ReqEndpoint(),
+			Model:    req.ReqModel(),
 		}
 		return ir
 	}
@@ -255,14 +294,26 @@ func (p *RedisSortedSetProducer) SubmitRequest(ctx context.Context, req api.Requ
 		return fmt.Errorf("failed to create request token: %w", err)
 	}
 	ir.RequestToken = token
-
 	ir.EnqueueSeq = enqueueSeqPlaceholder
 
-	msgBytes, err := json.Marshal(ir)
+	if payload := r.ReqPayload(); payload != nil {
+		trimmed := bytes.TrimSpace(payload)
+		if !json.Valid(trimmed) || (trimmed[0] != '{' && string(trimmed) != "null") {
+			return errors.New("invalid payload: must be a JSON object or null")
+		}
+	}
+
+	var envelope, payload []byte
+	if p.payloadKeys {
+		ir.PayloadRef = api.RequestPayloadKey(r.ReqID(), token)
+		envelope, payload, err = api.SplitPayload(ir)
+	} else {
+		envelope, err = json.Marshal(ir)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
-	at := bytes.Index(msgBytes, []byte(enqueueSeqPlaceholderJSON))
+	at := bytes.Index(envelope, []byte(enqueueSeqPlaceholderJSON))
 	if at < 0 {
 		return errors.New("marshaled request is missing the enqueue_seq placeholder")
 	}
@@ -271,25 +322,59 @@ func (p *RedisSortedSetProducer) SubmitRequest(ctx context.Context, req api.Requ
 	// This prevents a previously cancelled/completed request ID from poisoning
 	// a later submission that legitimately reuses the same ID.
 	targetQueue := ir.RequestQueueName
-	err = submitRequestScript.Run(ctx, p.client,
-		[]string{
-			enqueueSeqKey(targetQueue, deadline),
+	seqExpireAt := time.Unix(deadline, 0).Add(enqueueSeqGrace).Unix()
+	payloadTTL := activeTTL + payloadTTLGrace
+	if p.clusterKeys {
+		err = p.enqueueCluster(ctx, r.ReqID(), ir.RequestToken, targetQueue, deadline, activeTTL, seqExpireAt,
+			envelope[:at+len(enqueueSeqFieldJSON)], envelope[at+len(enqueueSeqPlaceholderJSON):],
+			ir.PayloadRef, payload, payloadTTL)
+	} else {
+		keys := []string{
+			enqueueSeqKey(targetQueue, deadline, false),
 			api.RequestCancellationKey(r.ReqID()),
 			api.RequestActiveTokenKey(r.ReqID()),
 			targetQueue,
-		},
-		ir.RequestToken,
-		max(activeTTL.Milliseconds(), 1),
-		time.Unix(deadline, 0).Add(enqueueSeqGrace).Unix(),
-		msgBytes[:at+len(enqueueSeqFieldJSON)],
-		msgBytes[at+len(enqueueSeqPlaceholderJSON):],
-		deadline,
-	).Err()
+		}
+		args := []any{
+			ir.RequestToken,
+			max(activeTTL.Milliseconds(), 1),
+			seqExpireAt,
+			envelope[:at+len(enqueueSeqFieldJSON)],
+			envelope[at+len(enqueueSeqPlaceholderJSON):],
+			deadline,
+		}
+		if ir.PayloadRef != "" {
+			keys = append(keys, ir.PayloadRef)
+			args = append(args, payload, payloadTTL.Milliseconds())
+		}
+		err = submitRequestScript.Run(ctx, p.client, keys, args...).Err()
+	}
 	if err != nil {
 		return fmt.Errorf("failed to add request to queue: %w", err)
 	}
 
 	return nil
+}
+
+// enqueueCluster is SubmitRequest's write path when the keys cannot share a
+// slot. The markers and the payload are written first with single-key
+// commands, then the sequence stamp and ZADD run in one script on the queue's
+// slot. If the script fails, the marker and payload merely outlive a request
+// that never enqueued, and expire with the deadline.
+func (p *RedisSortedSetProducer) enqueueCluster(ctx context.Context, reqID, token, queue string, deadline int64, activeTTL time.Duration, seqExpireAt int64, jsonBefore, jsonAfter []byte, payloadRef string, payload []byte, payloadTTL time.Duration) error {
+	pipe := p.client.Pipeline()
+	pipe.Del(ctx, api.RequestCancellationKey(reqID))
+	pipe.Set(ctx, api.RequestActiveTokenKey(reqID), token, activeTTL)
+	if payloadRef != "" {
+		pipe.Set(ctx, payloadRef, payload, payloadTTL)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return err
+	}
+	return enqueueRequestScript.Run(ctx, p.client,
+		[]string{enqueueSeqKey(queue, deadline, true), queue},
+		seqExpireAt, jsonBefore, jsonAfter, deadline,
+	).Err()
 }
 
 // CancelRequests marks request IDs as cancelled so dequeue/dispatch paths can drop them.
@@ -298,16 +383,23 @@ func (p *RedisSortedSetProducer) CancelRequests(ctx context.Context, requestIDs 
 		return nil
 	}
 
+	// The marker copies the active generation token so a later submission
+	// reusing the ID is not cancelled with it. Two single-key commands
+	// rather than one script: the keys sit in different cluster slots, and
+	// a resubmission racing the copy only ever leaves the older token in the
+	// marker, which the dispatcher already treats as "not this generation".
 	for _, requestID := range requestIDs {
 		if requestID == "" {
 			continue
 		}
-		if _, err := markRequestCancelledScript.Run(
-			ctx,
-			p.client,
-			[]string{api.RequestActiveTokenKey(requestID), api.RequestCancellationKey(requestID)},
-			int(cancellationMarkerTTL/time.Second),
-		).Result(); err != nil {
+		active, err := p.client.Get(ctx, api.RequestActiveTokenKey(requestID)).Result()
+		if errors.Is(err, redis.Nil) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("failed to mark request %q as cancelled: %w", requestID, err)
+		}
+		if err := p.client.Set(ctx, api.RequestCancellationKey(requestID), active, cancellationMarkerTTL).Err(); err != nil {
 			return fmt.Errorf("failed to mark request %q as cancelled: %w", requestID, err)
 		}
 	}
@@ -381,6 +473,13 @@ func (p *RedisSortedSetProducer) ClearRequestQueue(ctx context.Context) error {
 
 // ClearResultQueue removes all results from the queue.
 func (p *RedisSortedSetProducer) ClearResultQueue(ctx context.Context) error {
-	keys := newResultClaimKeys(p.resultQueueName)
-	return p.client.Del(ctx, keys.pending, keys.claimed, keys.owners, keys.idx, keys.tombstones).Err()
+	keys := newResultClaimKeys(p.resultQueueName, p.clusterKeys)
+	// One DEL per key: a multi-key DEL across slots is illegal in cluster
+	// mode, and the pending list never shares a slot with the others there.
+	for _, key := range []string{keys.pending, keys.claimed, keys.owners, keys.idx, keys.tombstones} {
+		if err := p.client.Del(ctx, key).Err(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
