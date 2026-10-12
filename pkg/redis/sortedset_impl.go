@@ -87,22 +87,23 @@ var (
 	_ SortedSetQueueReconfigurer           = (*RedisSortedSetFlow)(nil)
 )
 
-var cleanupRequestStateScript = redis.NewScript(`
-local token = ARGV[1]
-if token == "" then
-  return 0
-end
-if redis.call("GET", KEYS[1]) == token then
+// deleteIfTokenScript deletes one per-request marker only while it still
+// holds the given generation token. The active-token and cancellation
+// markers are cleared independently: they live in different cluster slots,
+// and neither check depends on the other.
+var deleteIfTokenScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
   redis.call("DEL", KEYS[1])
+  return 1
 end
-if redis.call("GET", KEYS[2]) == token then
-  redis.call("DEL", KEYS[2])
-end
-return 1
+return 0
 `)
 
 type RedisSortedSetFlow struct {
-	rdb                 *redis.Client
+	rdb redis.UniversalClient
+	// clusterKeys selects the hash-tagged layout for private claim keys so
+	// each per-queue script stays within one Redis Cluster slot.
+	clusterKeys         bool
 	cancellationChecker api.CancellationChecker
 	retryChannel        chan pipeline.RetryMessage
 	resultChannel       chan api.ResultMessage
@@ -143,7 +144,7 @@ type RedisSortedSetFlow struct {
 }
 
 type redisCancellationChecker struct {
-	rdb *redis.Client
+	rdb redis.UniversalClient
 }
 
 func (c *redisCancellationChecker) IsCancelled(ctx context.Context, requestID, requestToken string) (bool, error) {
@@ -262,12 +263,13 @@ func (r *RedisSortedSetFlow) newRequestChannel(cfg SortedSetQueueConfig) (reques
 }
 
 func NewRedisSortedSetFlow(cfg SortedSetConfig, workerPools []pipeline.WorkerPoolConfig, gateFactory pipeline.GateFactory) (*RedisSortedSetFlow, error) {
-	redisOpts, err := ParseRedisOptions(cfg.URL)
+	rdb, err := newUniversalClient(cfg.connection())
 	if err != nil {
 		return nil, fmt.Errorf("invalid Redis connection config: %w", err)
 	}
 	r := &RedisSortedSetFlow{
-		rdb:                    redis.NewClient(redisOpts),
+		rdb:                    rdb,
+		clusterKeys:            cfg.Mode == ModeCluster,
 		queues:                 make(map[string]*queueRuntime, len(cfg.Queues)),
 		queueOrder:             make([]string, 0, len(cfg.Queues)),
 		retryChannel:           make(chan pipeline.RetryMessage),
@@ -812,8 +814,12 @@ func (r *RedisSortedSetFlow) processMessagesWithConfig(ctx context.Context, msgC
 		return
 	}
 
+	var ready []claimedRequest
+	handled := 0
+	defer func() { r.releaseClaimed(queueName, ready[handled:], logger) }()
+
 	for _, z := range zs {
-		member := z.Member.(string)
+		member, _ := z.Member.(string)
 		ir, deadline, ok := r.parseMessage(member, logger)
 		if !ok || ir == nil || ir.PublicRequest == nil {
 			// Unparsable entry: no request identity survives to redeliver,
@@ -973,30 +979,150 @@ func (r *RedisSortedSetFlow) processMessagesWithConfig(ctx context.Context, msgC
 			pipeline.ReleaseGateReleases(releases)
 			continue
 		}
-
-		if len(releases) > 0 {
-			// Defensive: never orphan a lingering reservation for this id — release
-			// any prior closure instead of silently overwriting it (see #311).
-			if prev, loaded := r.activeReleases.Swap(reqID, releases); loaded {
-				if rels, ok := prev.([]pipeline.GateReleaseFunc); ok {
-					pipeline.ReleaseGateReleases(rels)
-				}
-			}
+		if ir.PayloadRef != "" {
+			ready = append(ready, claimedRequest{ir: ir, member: member, token: token, releases: releases})
+			continue
 		}
-
-		// Stamp ingestion time as the message enters the in-process buffer so the
-		// worker can record queue residence time when it pulls the message.
-		ir.IngestionTime = time.Now()
-
-		select {
-		case msgChannel <- ir:
-		case <-ctx.Done():
-			r.activeReleases.Delete(reqID)
+		if !r.dispatch(ctx, msgChannel, ir, releases) {
 			releaseOnShutdown(token, ir.RequestToken)
 			pipeline.ReleaseGateReleases(releases)
 			return
 		}
 	}
+
+	if len(ready) == 0 {
+		return
+	}
+	payloadErrs, err := r.fetchPayloads(ctx, ready)
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "Failed to load request payloads", "queue", queueName)
+		return
+	}
+
+	for i, c := range ready {
+		ir := c.ir
+		if payloadErrs[i] != "" {
+			select {
+			case r.resultChannel <- api.NewErrorResult(ir.PublicRequest, ir.InternalRouting, api.ErrCodePayloadUnavailable, payloadErrs[i]):
+			case <-ctx.Done():
+				return
+			}
+			pipeline.ReleaseGateReleases(c.releases)
+			handled++
+			continue
+		}
+		if !r.dispatch(ctx, msgChannel, ir, c.releases) {
+			return
+		}
+		handled++
+	}
+}
+
+// dispatch hands a claimed request downstream, reporting false when ctx ends
+// first.
+func (r *RedisSortedSetFlow) dispatch(ctx context.Context, msgChannel chan *api.InternalRequest, ir *api.InternalRequest, releases []pipeline.GateReleaseFunc) bool {
+	reqID := ir.PublicRequest.ReqID()
+	if len(releases) > 0 {
+		// Defensive: never orphan a lingering reservation for this id — release
+		// any prior closure instead of silently overwriting it (see #311).
+		if prev, loaded := r.activeReleases.Swap(reqID, releases); loaded {
+			if rels, ok := prev.([]pipeline.GateReleaseFunc); ok {
+				pipeline.ReleaseGateReleases(rels)
+			}
+		}
+	}
+
+	// Stamp ingestion time as the message enters the in-process buffer so the
+	// worker can record queue residence time when it pulls the message.
+	ir.IngestionTime = time.Now()
+
+	select {
+	case msgChannel <- ir:
+		return true
+	case <-ctx.Done():
+		r.activeReleases.Delete(reqID)
+		return false
+	}
+}
+
+type claimedRequest struct {
+	ir       *api.InternalRequest
+	member   string
+	token    string
+	releases []pipeline.GateReleaseFunc
+}
+
+// releaseClaimed hands claimed requests that were never dispatched back to
+// the queue.
+func (r *RedisSortedSetFlow) releaseClaimed(queueName string, claimed []claimedRequest, logger logr.Logger) {
+	for _, c := range claimed {
+		reqID := c.ir.PublicRequest.ReqID()
+		if err := retryRedisOp(context.Background(), func(ctx context.Context) error {
+			return r.releaseClaim(ctx, queueName, reqID, c.ir.RequestToken, c.member, c.ir.QueueScore(), c.token)
+		}); err != nil {
+			logger.V(logutil.DEFAULT).Error(err, "Failed to release claim", "id", reqID)
+		}
+		pipeline.ReleaseGateReleases(c.releases)
+	}
+}
+
+// fetchPayloads attaches each request's referenced payload with one MGET and
+// returns, per request, why its payload is unavailable ("" when ready).
+func (r *RedisSortedSetFlow) fetchPayloads(ctx context.Context, claimed []claimedRequest) ([]string, error) {
+	refs := make([]string, len(claimed))
+	for i, c := range claimed {
+		refs[i] = c.ir.PayloadRef
+	}
+	values, err := r.readPayloads(ctx, refs)
+	if err != nil {
+		return nil, fmt.Errorf("fetch %d request payloads: %w", len(refs), err)
+	}
+	errs := make([]string, len(claimed))
+	for i, v := range values {
+		payload, found := v.(string)
+		if !found {
+			errs[i] = "request payload is missing"
+			continue
+		}
+		if err := api.AttachPayload(claimed[i].ir, json.RawMessage(payload)); err != nil {
+			errs[i] = "request payload could not be attached"
+		}
+	}
+	return errs, nil
+}
+
+// readPayloads returns one value per ref, nil where the key is missing. One
+// MGET in standalone mode; in cluster mode the per-request keys span slots,
+// so a pipeline of GETs reaches each owning node in one round trip instead.
+func (r *RedisSortedSetFlow) readPayloads(ctx context.Context, refs []string) ([]any, error) {
+	if !r.clusterKeys {
+		return r.rdb.MGet(ctx, refs...).Result()
+	}
+	pipe := r.rdb.Pipeline()
+	cmds := make([]*redis.StringCmd, len(refs))
+	for i, ref := range refs {
+		cmds[i] = pipe.Get(ctx, ref)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, err
+	}
+	values := make([]any, len(refs))
+	for i, cmd := range cmds {
+		if v, err := cmd.Result(); err == nil {
+			values[i] = v
+		} else if !errors.Is(err, redis.Nil) {
+			return nil, err
+		}
+	}
+	return values, nil
+}
+
+func encodeRequest(ir *api.InternalRequest) ([]byte, error) {
+	if ir.PayloadRef == "" {
+		return json.Marshal(ir)
+	}
+	envelope, _, err := api.SplitPayload(ir)
+	return envelope, err
 }
 
 func (r *RedisSortedSetFlow) parseMessage(member string, logger logr.Logger) (*api.InternalRequest, float64, bool) {
@@ -1087,7 +1213,7 @@ func (r *RedisSortedSetFlow) flushRetryBatch(ctx context.Context, batch []pipeli
 		// Preserve the origin queue in the envelope so the retry mover can
 		// re-enter the message into the right queue once it is due.
 		msg.RequestQueueName = queueName
-		bytes, err := json.Marshal(msg.InternalRequest)
+		bytes, err := encodeRequest(msg.InternalRequest)
 		if err != nil {
 			logger.V(logutil.DEFAULT).Error(err, "Failed to marshal retry")
 			continue
@@ -1233,7 +1359,7 @@ func (r *RedisSortedSetFlow) flushResultBatch(ctx context.Context, batch []api.R
 		var ok bool
 		err := retryRedisOp(ctx, func(ctx context.Context) error {
 			var aerr error
-			ok, aerr = r.ackResult(ctx, claimQueue, resultQueue, result.ID, result.Routing.RequestToken, r.marshalResult(result), listTTL)
+			ok, aerr = r.ackResult(ctx, claimQueue, resultQueue, result.ID, result.Routing.RequestToken, result.Routing.PayloadRef, r.marshalResult(result), listTTL)
 			return aerr
 		})
 		if err != nil {
@@ -1262,13 +1388,12 @@ func (r *RedisSortedSetFlow) cleanupRequestStateByIDAndToken(ctx context.Context
 	if requestID == "" || requestToken == "" {
 		return nil
 	}
-	_, err := cleanupRequestStateScript.Run(
-		ctx,
-		r.rdb,
-		[]string{api.RequestActiveTokenKey(requestID), api.RequestCancellationKey(requestID)},
-		requestToken,
-	).Result()
-	return err
+	for _, key := range []string{api.RequestActiveTokenKey(requestID), api.RequestCancellationKey(requestID)} {
+		if err := deleteIfTokenScript.Run(ctx, r.rdb, []string{key}, requestToken).Err(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *RedisSortedSetFlow) marshalResult(msg api.ResultMessage) string {

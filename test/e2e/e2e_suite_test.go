@@ -63,6 +63,7 @@ var (
 
 	containerRuntime = detectContainerRuntime()
 	apImage          = env.GetEnvString("AP_IMAGE", "ghcr.io/llm-d/llm-d-async:e2e-test", ginkgo.GinkgoLogr)
+	oldAPImage       = env.GetEnvString("OLD_AP_IMAGE", "ghcr.io/llm-d/llm-d-async:v0.10.0", ginkgo.GinkgoLogr)
 	// TODO: switch EPP_IMAGE and ROUTER_VERSION to a release tag than "main"
 	eppImage = env.GetEnvString("EPP_IMAGE", "ghcr.io/llm-d/llm-d-router-endpoint-picker:main", ginkgo.GinkgoLogr)
 	// gaieVersion selects the gateway-api-inference-extension release whose
@@ -193,12 +194,14 @@ func setupK8sCluster() {
 	output, err := checkCmd.Output()
 	if err == nil && strings.Contains(string(output), kindClusterName) {
 		ginkgo.By("Kind cluster " + kindClusterName + " already exists, rebuilding and loading llm-d-async image")
-		command := exec.Command(containerRuntime, "build", "-t", apImage, projectRoot())
+		command := buildImageCommand(apImage, projectRoot())
 		session, err := gexec.Start(command, ginkgo.GinkgoWriter, ginkgo.GinkgoWriter)
 		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
 		gomega.Eventually(session).WithTimeout(600 * time.Second).Should(gexec.Exit(0))
 		kindLoadImage(apImage)
 		loadEPPImage()
+		pullIfMissing(oldAPImage)
+		kindLoadImage(oldAPImage)
 		return
 	}
 
@@ -231,7 +234,7 @@ func setupK8sCluster() {
 	gomega.Eventually(session).WithTimeout(600 * time.Second).Should(gexec.Exit(0))
 
 	ginkgo.By("Building llm-d-async image")
-	command = exec.Command(containerRuntime, "build", "-t", apImage, projectRoot())
+	command = buildImageCommand(apImage, projectRoot())
 	session, err = gexec.Start(command, ginkgo.GinkgoWriter, ginkgo.GinkgoWriter)
 	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
 	gomega.Eventually(session).WithTimeout(600 * time.Second).Should(gexec.Exit(0))
@@ -240,7 +243,7 @@ func setupK8sCluster() {
 
 	if simRoot != "" {
 		ginkgo.By("Building sim image from " + simRoot)
-		command = exec.Command(containerRuntime, "build", "-t", simImage, simRoot)
+		command = buildImageCommand(simImage, simRoot)
 		session, err = gexec.Start(command, ginkgo.GinkgoWriter, ginkgo.GinkgoWriter)
 		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
 		gomega.Eventually(session).WithTimeout(600 * time.Second).Should(gexec.Exit(0))
@@ -250,6 +253,9 @@ func setupK8sCluster() {
 
 	kindLoadImage(apImage)
 	kindLoadImage(simImage)
+
+	pullIfMissing(oldAPImage)
+	kindLoadImage(oldAPImage)
 
 	pullIfMissing(redisImage)
 	kindLoadImage(redisImage)
@@ -267,6 +273,15 @@ func setupK8sCluster() {
 	kindLoadImage("jaegertracing/all-in-one:1.76.0")
 
 	// The sim image is pulled with imagePullPolicy: Always directly by the cluster.
+}
+
+// buildImageCommand builds image into the local image store.
+func buildImageCommand(image, dir string) *exec.Cmd {
+	args := []string{"build", "-t", image}
+	if containerRuntime == "docker" {
+		args = append(args, "--load")
+	}
+	return exec.Command(containerRuntime, append(args, dir)...)
 }
 
 func kindLoadImage(image string) {
@@ -414,6 +429,11 @@ func applyManifests() {
 			"ap.image.tag":        imageTag,
 		})
 	}
+	oldRepo, oldTag := splitImage(oldAPImage)
+	helmInstall("old-dispatcher", helmValuesDir+"/old-dispatcher.yaml", map[string]string{
+		"ap.image.repository": oldRepo,
+		"ap.image.tag":        oldTag,
+	})
 }
 
 // kubectlPatchEnvoyNodePort patches the Envoy service to NodePort so test code
