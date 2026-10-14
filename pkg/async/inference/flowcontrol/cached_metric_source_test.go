@@ -39,6 +39,80 @@ func (c *countingMetricSource) Query(_ context.Context) ([]Sample, error) {
 	return c.samples, c.err
 }
 
+type blockingMetricSource struct {
+	calls   atomic.Int32
+	started chan struct{}
+	resume  chan struct{}
+}
+
+var _ MetricSource = (*blockingMetricSource)(nil)
+
+func (s *blockingMetricSource) Query(ctx context.Context) ([]Sample, error) {
+	if s.calls.Add(1) == 1 {
+		close(s.started)
+	}
+	select {
+	case <-s.resume:
+		return []Sample{{Value: 42.0}}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestCachedMetricSource_CancelledWaiter(t *testing.T) {
+	for _, deadline := range []bool{false, true} {
+		name := "cancelled"
+		if deadline {
+			name = "deadline exceeded"
+		}
+		t.Run(name, func(t *testing.T) {
+			inner := &blockingMetricSource{
+				started: make(chan struct{}),
+				resume:  make(chan struct{}),
+			}
+			cached := NewCachedMetricSource(inner, time.Hour)
+			firstDone := make(chan error, 1)
+			go func() {
+				_, err := cached.Query(context.Background())
+				firstDone <- err
+			}()
+			<-inner.started
+
+			ctx, cancel := context.WithCancel(context.Background())
+			expectedErr := context.Canceled
+			if deadline {
+				cancel()
+				ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+				expectedErr = context.DeadlineExceeded
+			} else {
+				cancel()
+			}
+			defer cancel()
+
+			waiterDone := make(chan error, 1)
+			go func() {
+				_, err := cached.Query(ctx)
+				waiterDone <- err
+			}()
+			select {
+			case err := <-waiterDone:
+				if !errors.Is(err, expectedErr) {
+					t.Errorf("Query error = %v, want %v", err, expectedErr)
+				}
+			case <-time.After(time.Second):
+				t.Error("cancelled Query is blocked by another caller's source query")
+			}
+
+			close(inner.resume)
+			require.NoError(t, <-firstDone)
+			samples, err := cached.Query(context.Background())
+			require.NoError(t, err)
+			require.Equal(t, []Sample{{Value: 42.0}}, samples)
+			require.Equal(t, int32(1), inner.calls.Load())
+		})
+	}
+}
+
 func TestCachedMetricSource_CachesWithinTTL(t *testing.T) {
 	inner := &countingMetricSource{
 		samples: []Sample{{Value: 42.0}},
