@@ -18,7 +18,7 @@ package flowcontrol
 
 import (
 	"context"
-	"sync"
+	"fmt"
 	"time"
 )
 
@@ -29,7 +29,8 @@ type CachedMetricSource struct {
 	source MetricSource
 	ttl    time.Duration
 
-	mu      sync.Mutex
+	queryLock chan struct{}
+
 	samples []Sample
 	err     error
 	expiry  time.Time
@@ -39,16 +40,22 @@ type CachedMetricSource struct {
 // for the specified TTL duration.
 func NewCachedMetricSource(source MetricSource, ttl time.Duration) *CachedMetricSource {
 	return &CachedMetricSource{
-		source: source,
-		ttl:    ttl,
+		source:    source,
+		ttl:       ttl,
+		queryLock: make(chan struct{}, 1),
 	}
 }
 
 // Query returns cached samples if the cache is still valid, otherwise
-// delegates to the underlying source and caches the result.
+// delegates to the underlying source and caches the result. Waiting for an
+// in-flight query honors the caller's context.
 func (c *CachedMetricSource) Query(ctx context.Context) ([]Sample, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	select {
+	case c.queryLock <- struct{}{}:
+		defer func() { <-c.queryLock }()
+	case <-ctx.Done():
+		return nil, fmt.Errorf("waiting for metric refresh: %w", ctx.Err())
+	}
 
 	now := time.Now()
 	if now.Before(c.expiry) {
