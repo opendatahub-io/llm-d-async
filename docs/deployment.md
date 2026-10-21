@@ -14,16 +14,24 @@ AP_IMAGE_PULL_POLICY=Always
 ```bash
 make deploy-ap-on-k8s
 ```
-- To test a request (only for the Redis implementation):
+- To test a request with the `redis-pubsub` transport, use the request and result
+  channel names from your transport configuration (the examples below use
+  `request-queue` and `result-queue`). For the recommended `redis-sortedset`
+  transport, use a [producer](development.md#development) instead of `PUBLISH`.
     - Subscribing to the result channel (different terminal window):
     ```bash
        export REDIS_IP=....
-       kubectl run -i -t subscriberbox --rm --image=redis --restart=Never -- /usr/local/bin/redis-cli -h $REDIS_IP SUBSCRIBE result-queue
+       kubectl run -i subscriberbox --rm --image=redis --restart=Never -- /usr/local/bin/redis-cli -h "$REDIS_IP" SUBSCRIBE result-queue
     ```
-    - Publishing a request:
+    - Publishing a request, replacing `food-review-1` with a model served by your
+      inference gateway. Direct broker messages must use the
+      [internal wire format](transports.md#internal-wire-format):
     ```bash
        export REDIS_IP=....
-       kubectl run --rm -i -t publishmsgbox --image=redis --restart=Never -- /usr/local/bin/redis-cli -h $REDIS_IP PUBLISH request-queue '{"id" : "testmsg", "payload":{ "model":"food-review-1", "prompt":"Hi, good morning "}, "deadline" :23472348233323 }'
+       export MODEL=food-review-1
+       DEADLINE=$(($(date +%s) + 300))
+       REQUEST="{\"request_kind\":\"plain\",\"data\":{\"id\":\"testmsg\",\"payload\":{\"model\":\"$MODEL\",\"prompt\":\"Hi, good morning\",\"max_tokens\":16},\"deadline\":$DEADLINE}}"
+       kubectl run --rm -i publishmsgbox --image=redis --restart=Never -- /usr/local/bin/redis-cli -h "$REDIS_IP" PUBLISH request-queue "$REQUEST"
      ```
 
 ## Command Line Parameters
@@ -34,7 +42,7 @@ make deploy-ap-on-k8s
 |------|---------|-------------|
 | `concurrency` | `64` | Number of concurrent workers (per pool if unspecified). The processor is I/O-bound (each worker holds one in-flight request for its full duration), so in-flight concurrency caps throughput — see [Queues, Topics, and Worker Pools](../README.md#queues-topics-and-worker-pools). |
 | `gate-wait-timeout` | `5m` | Maximum time a worker parks one request at a pool gate before recoverably re-enqueueing it. Independent of `request-timeout`; `0` waits until the request's own deadline. |
-| `transport` | `redis-pubsub` | The transport (message queue) implementation. One of `redis-pubsub` (**deprecated**: it still works but will be removed in a future release), `redis-sortedset`, `gcp-pubsub`. Gating is configured per queue/topic via `gate_type` in the transport config (this replaces the former `gcp-pubsub-gated` implementation). |
+| `transport` | `redis-pubsub` | The transport (message queue) implementation. One of `redis-pubsub` (**deprecated**: it still works but will be removed in a future release), `redis-sortedset`, `gcp-pubsub`, `sql` (**experimental**). Gating is configured per queue/topic via `gate_type` in the transport config (this replaces the former `gcp-pubsub-gated` implementation). |
 | `transport-config` | — | Inline JSON transport configuration. See [Transport Configuration](transports.md#transport-configuration). Mutually exclusive with `transport-config-file`; exactly one of the two is required. |
 | `transport-config-file` | — | Path to a JSON file with the transport configuration. Mutually exclusive with `transport-config`. |
 | `transport-config-watch-interval` | `0` | For `redis-sortedset` only, periodically reloads the `queues` field from `transport-config-file`. The file must contain a complete valid transport configuration. Changes to other transport fields require a restart. |
@@ -63,7 +71,7 @@ make deploy-ap-on-k8s
 | `metrics-port` | `9090` | Port serving Prometheus metrics. |
 | `metrics-endpoint-auth` | `true` | Enables authentication and authorization of the metrics endpoint. |
 | `health-port` | `8081` | The health probe port. |
-| `metrics-backlog-poll-interval` | `15s` | Interval to poll the broker for queue backlog metrics (`0` disables). Only applies to transports that support it (`redis-sortedset`, `gcp-pubsub`). |
+| `metrics-backlog-poll-interval` | `15s` | Interval to poll the broker for queue backlog metrics (`0` disables). Only applies to transports that support it (`redis-sortedset`, `gcp-pubsub`, `sql`). |
 
 **TLS (outbound, towards the inference gateway):**
 

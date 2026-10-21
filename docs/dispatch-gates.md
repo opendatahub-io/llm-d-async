@@ -14,6 +14,7 @@ The available gate types, at a glance:
 | `endpoint-scrape` | budget | Scrapes a raw `/metrics` endpoint directly — no Prometheus server required. |
 | `local-max-concurrency` | admission | Caps concurrent in-flight requests per queue using in-process state. |
 | `redis-quota` | admission | Per-attribute quota (rate limit or concurrency) via Redis. |
+| `sql-quota` | admission | `redis-quota` counted in the `sql` transport's Postgres database (**experimental**). |
 | `tier-priority-admission` | admission | Three-way verdict from saturation × tier × classification. |
 | `composite` | combinator | Combines multiple gates: minimum budget across all inner dispatch gates, all-or-nothing quota acquisition across inner attribute gates. |
 | `wait-on-refuse` | combinator | Wraps an inner gate and converts `ActionRefuse` into `ActionWait` (parking in-memory instead of broker redelivery). |
@@ -230,7 +231,7 @@ The available gate types, at a glance:
     `llm_d_epp_ready_endpoints{name="<pool>"}` and `llm_d_epp_per_endpoint_queue_size{name="<pool>"}`
     (EPP metrics) and, for the vLLM source, the `inference_pool` label on scraped vLLM metrics
     (added via relabeling from pod labels).
-  - `namespace` (optional): Kubernetes namespace to scope metric queries. Required when multiple namespaces share the same pool name with a shared Prometheus instance.
+  - `namespace` (optional): Kubernetes namespace to scope metric queries. When omitted, each source requires its matching metrics to identify a single namespace. An ambiguous source returns no samples, so the cascade tries the next source; if none resolve, the configured `fallback` applies (default `0`). Set this explicitly when a shared Prometheus instance contains same-named pools in multiple namespaces.
   - `max_concurrency` (optional): Per-endpoint request capacity (`MaxConcurrency` in the [inference scheduler's saturation detector](https://github.com/llm-d/llm-d-inference-scheduler/blob/main/pkg/epp/framework/plugins/flowcontrol/saturationdetector/concurrency/config.go)). Default is `100` (matching the inference scheduler default). See [sizing `max_concurrency`](#sizing-max_concurrency) below — this is a **per-pod** number, and setting it above what a pod actually serves makes the gate inert.
   - `baseline` (optional): Reserved baseline B. The gate closes when D ≤ B. Default is `0.05`.
   - `fallback` (optional): Fallback budget value (0.0-1.0) returned when all metric sources are unavailable. Default is `0.0` (fail closed).
@@ -265,7 +266,7 @@ The available gate types, at a glance:
 
     ```promql
     max_over_time(
-      (sum(vllm:num_requests_running{inference_pool="<pool>"}) / on() llm_d_epp_ready_endpoints{name="<pool>"})[1h:]
+      (sum(vllm:num_requests_running{inference_pool="<pool>",namespace="<namespace>"}) / on() max(llm_d_epp_ready_endpoints{name="<pool>",namespace="<namespace>"}))[1h:]
     )
     ```
 
@@ -328,6 +329,8 @@ The available gate types, at a glance:
   - `window` (optional): The time window for rate limiting (e.g., `1m`, `10s`). Default is `1m`.
   - `prefix` (optional): Redis key prefix. Default is `quota:`.
   - `gating_mode` (optional): `blocking` or `classifying`. In `classifying` mode, the gate never blocks but tags the message with its quota status (`reserved` or `overflow`) in the internal metadata — see [Reserved and Overflow](../README.md#reserved-and-overflow). Default is `blocking`.
+
+- `sql-quota` (**experimental**): The same quota as `redis-quota`, counted in the database of the `sql` transport, so it needs no Redis and works only with `--transport sql`. It takes the same parameters except `address`; `prefix` namespaces keys in the quota tables, and `window` applies only to `rate-limit` mode. Limits are exact across every processor sharing the database: each processor sends one query per quota key at a time, and requests that arrive meanwhile share the next query. A rate limit admits at most `limit` requests in any `window`; gates on the same key with different windows count separately. Concurrency slots belong to the processor that took them and stop counting once it stops heartbeating for `lease_ttl_seconds`, so a crashed processor's slots come back without a TTL on the counter.
 
 - `tier-priority-admission`: Implements a three-way admission verdict based on saturation, queue tier, and reservation classification. Saturation is determined by evaluating an inner gate: if the inner gate returns `ActionRefuse`, the pool is considered saturated. If the pool is saturated: (1) returns `ActionWait` if classification is `reserved` (parking worker threads cleanly); (2) drops immediately with a `429` status payload if tier is `interactive` and classification is `overflow`; (3) otherwise — including `async`/`batch` overflow and unclassified requests — returns `ActionRefuse` to place the request back in the queue. If not saturated, returns `ActionContinue`.
   - `saturation_gate` (**required**): The type string of the inner gate used to evaluate pool saturation (e.g. `"prometheus-query"`).
