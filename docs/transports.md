@@ -236,7 +236,7 @@ In cluster mode every multi-key Lua script must stay within one hash slot. The s
 
 A result list usually lands in a different slot than its request queue. Publishing a result then takes two single-slot steps instead of one atomic script: the dispatcher renews its lease, pushes the record, then drops the claim. A crash between the push and the drop leaves the claim to expire and be redelivered, so a consumer can see that result twice. This is within the transport's documented at-least-once contract, and [durable result delivery](guides/durable-result-delivery.md) de-duplicates it by `(ID, RequestToken)`; name the result list with the queue's hash tag (for example `{request-sortedset}:results`) if you want the atomic path back. A payload stored apart with `WithPayloadKeys` lives in its own slot too, so in cluster mode it is deleted with a separate command after the ack, and the producer writes it before the enqueue; a payload key that outlives a crash expires on its own.
 
-The `redis`, `redis-quota` and `redis-leased-rate` dispatch gates take a single `address` and open a standalone connection to it. Against a cluster, point them at a node that owns the slot of their key (or front the cluster with a proxy); a key on another node answers `MOVED` and the gate fails closed.
+The `redis`, `redis-quota` and `redis-leased-rate` gates reuse this transport's client, including its credentials and database, when their `address` matches (see [dispatch gates](dispatch-gates.md)); otherwise they open a standalone connection. Against a cluster, point standalone gates at a node that owns the key's slot or front them with a proxy, because a `MOVED` response fails the gate closed.
 
 ## Implementations
 
@@ -300,7 +300,7 @@ This transport does not support per-queue dispatch gates (see [Queue and Topic E
 
 ### SQL (Postgres)
 
-> **Experimental:** opt in with `--transport sql`. Its tables and config may change between releases without a migration or deprecation period. The database records the schema version that created it, and a processor or producer from a build with a different schema refuses to start against it; drop the `async_*` tables before upgrading to such a release.
+> **Experimental:** opt in with `--transport sql`. Its config may change between releases without a deprecation period. The schema is versioned: the processor applies pending migrations at startup, and a producer refuses to start against a database that is missing the schema or behind it. See [SQL Transport Schema Migrations](sql-migrations.md).
 
 A persisted implementation on Postgres, selected with `--transport sql`. It keeps the `redis-sortedset` semantics (earliest-deadline-first dispatch, fenced claims with lease-based redelivery, per-queue gates, exact backlog and deadline-proximity metrics) without a Redis dependency: several processors share one database. Producers submit with the `producer-sql` module against the same database. The `redis` and `redis-leased-rate` gate types still need Redis; use `sql-quota` in place of `redis-quota`. Every other gate type works unchanged.
 
