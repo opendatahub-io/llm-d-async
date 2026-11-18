@@ -1,5 +1,5 @@
 # Build the manager binary
-FROM quay.io/projectquay/golang:1.27 AS builder
+FROM golang:1.27.3 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 # Linker flags. The Makefile and the release workflow pass the pkg/version
