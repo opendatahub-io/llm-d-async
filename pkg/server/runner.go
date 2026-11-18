@@ -96,8 +96,10 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 		return err
 	}
 
-	gateFactory = flowcontrol.NewGateFactoryWithCacheTTL(opts.Prometheus.URL, opts.Prometheus.CacheTTL).
-		WithLogger(setupLog)
+	gateFactory, err = newGateFactory(opts.Prometheus, setupLog)
+	if err != nil {
+		return err
+	}
 
 	policy, err := loadRequestMergePolicy(opts.mergePolicyConfigFile(), ctx)
 	if err != nil {
@@ -410,6 +412,29 @@ func loadTransforms(ctx context.Context, configFile string, setupLog logr.Logger
 	}
 	setupLog.Info("Loaded request transform plugins", "count", chain.Len())
 	return chain, nil
+}
+
+// newGateFactory builds the gate factory from the Prometheus options,
+// including the CA and bearer token Prometheus gates authenticate with.
+func newGateFactory(cfg PrometheusConfig, logger logr.Logger) (*flowcontrol.GateFactory, error) {
+	transport, err := flowcontrol.NewPrometheusRoundTripper(cfg.CACertFile, cfg.BearerTokenFile)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.CACertFile != "" && cfg.BearerTokenFile == "" && flowcontrol.IsGMPURL(cfg.URL) {
+		// The explicit transport takes precedence over GMP's Application
+		// Default Credentials, so this combination bypasses ADC but provides
+		// no credentials of its own; queries will get HTTP 401 and the gates
+		// will fall back instead of failing closed. This configuration can
+		// never succeed, so fail closed at startup like the other GMP
+		// misconfigurations.
+		return nil, fmt.Errorf("prometheus-ca-cert alone does not authenticate to Google Managed " +
+			"Prometheus; either omit both prometheus flags to let gates use " +
+			"Application Default Credentials, or also set prometheus-bearer-token-file")
+	}
+	return flowcontrol.NewGateFactoryWithCacheTTL(cfg.URL, cfg.CacheTTL).
+		WithPrometheusTransport(transport).
+		WithLogger(logger), nil
 }
 
 func buildTLSConfig(cfg TLSConfig) (*tls.Config, error) {
