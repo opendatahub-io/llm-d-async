@@ -310,6 +310,29 @@ func (f *GateFactory) Close() error {
 //
 // For unsupported or unknown gate types, returns ConstOpenGate as a safe default.
 func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error) {
+	return f.createGate(cfg, "")
+}
+
+func (f *GateFactory) createGate(cfg pipeline.GateConfig, index string) (pipeline.Gate, error) {
+	gate, err := f.buildGate(cfg, index)
+	if metric, ok := gate.(*MetricDispatchGate); ok {
+		metric.WithOwner(cfg.Owner)
+		metric.readings.Type = cfg.GateType
+		metric.readings.Index = index
+	}
+	return gate, err
+}
+
+func (f *GateFactory) buildGate(cfg pipeline.GateConfig, index string) (pipeline.Gate, error) {
+	childGate := func(child pipeline.GateConfig, position int) (pipeline.Gate, error) {
+		child.Owner = cfg.Owner
+		path := strconv.Itoa(position)
+		if index != "" {
+			path = index + "." + path
+		}
+		return f.createGate(child, path)
+	}
+
 	params := cfg.GateParams
 	if params == nil {
 		params = map[string]any{}
@@ -323,9 +346,8 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 		}
 
 		var innerGates []pipeline.Gate
-		for _, innerCfg := range configs {
-			innerCfg.Owner = cfg.Owner
-			gate, err := f.CreateGate(innerCfg)
+		for i, innerCfg := range configs {
+			gate, err := childGate(innerCfg, i)
 			if err != nil {
 				return nil, fmt.Errorf("composite gate failed to create inner gate %q: %w", innerCfg.GateType, err)
 			}
@@ -340,8 +362,7 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 			return nil, err
 		}
 
-		innerCfg.Owner = cfg.Owner
-		innerGate, err := f.CreateGate(innerCfg)
+		innerGate, err := childGate(innerCfg, 0)
 		if err != nil {
 			return nil, fmt.Errorf("wait-on-refuse gate failed to create inner gate %q: %w", innerCfg.GateType, err)
 		}
@@ -358,11 +379,10 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 			return nil, fmt.Errorf("tier-priority-admission gate failed to parse 'saturation_gate_params': %w", err)
 		}
 
-		satGate, err := f.CreateGate(pipeline.GateConfig{
+		satGate, err := childGate(pipeline.GateConfig{
 			GateType:   satGateType,
 			GateParams: satGateParams,
-			Owner:      cfg.Owner,
-		})
+		}, 0)
 		if err != nil {
 			return nil, fmt.Errorf("tier-priority-admission gate failed to create saturation gate %q: %w", satGateType, err)
 		}
@@ -454,7 +474,6 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 			ms = NewCachedMetricSource(source, f.cacheTTL)
 		}
 		return NewSaturationDispatchGate(ms, threshold, fallback).
-			WithOwner(cfg.Owner).
 			WithInferencePool(paramString(params, "pool", "")), nil
 
 	case "prometheus-budget":
@@ -526,7 +545,6 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 		)
 
 		return NewBudgetDispatchGate(ms, baseline, fallback).
-			WithOwner(cfg.Owner).
 			WithInferencePool(pool), nil
 
 	case "inference-pool-ready":
@@ -610,7 +628,6 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 		// the inference_pool label on async_gate_metric_value; it does not affect
 		// the query. pool_name comes from the queue or pool that owns the gate.
 		return NewMetricDispatchGate(cachedSource(source, f.cacheTTL), 0.0, fallback).
-			WithOwner(cfg.Owner).
 			WithInferencePool(paramString(params, "pool", "")), nil
 
 	case "endpoint-scrape":
@@ -650,6 +667,15 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 			return nil, fmt.Errorf("endpoint-scrape gate failed to parse 'pods_labels': %w", err)
 		}
 
+		var absentValue *float64
+		if _, ok := params["absent_value"]; ok {
+			v, err := paramFloat(params, "absent_value", 0)
+			if err != nil {
+				return nil, err
+			}
+			absentValue = &v
+		}
+
 		scrapeCfg := ScrapeConfig{
 			URL:            url,
 			MetricName:     metric,
@@ -659,6 +685,24 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 			PodsURL:        paramString(params, "pods_url", ""),
 			PodsMetric:     paramString(params, "pods_metric", ""),
 			PodsLabels:     podsLabels,
+			AbsentValue:    absentValue,
+		}
+
+		switch admission := paramString(params, "admission", "budget"); admission {
+		case "budget":
+		case "counted":
+			if maxCountPerPod <= 0 || valueType != "saturation" {
+				return nil, fmt.Errorf("endpoint-scrape admission 'counted' needs a count metric: max_count_per_pod > 0 and value_type saturation")
+			}
+			if baseline != 0 || fallback != 0 {
+				return nil, fmt.Errorf("endpoint-scrape admission 'counted' takes neither baseline nor fallback: size the headroom with max_count_per_pod; a failed scrape admits nothing")
+			}
+			if f.cacheTTL <= 0 {
+				return nil, fmt.Errorf("endpoint-scrape admission 'counted' takes one reading per --prometheus-cache-ttl, which must be greater than 0")
+			}
+			return NewHeadroomGate(NewScrapeMetricSource(scrapeCfg), f.cacheTTL).WithOwner(cfg.Owner), nil
+		default:
+			return nil, fmt.Errorf("endpoint-scrape admission must be either 'budget' or 'counted', got %q", admission)
 		}
 
 		var ms MetricSource = NewScrapeMetricSource(scrapeCfg)
